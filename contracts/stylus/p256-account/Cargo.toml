@@ -1,0 +1,28 @@
+[package]
+name = "p256-account"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+stylus-sdk.workspace = true
+ruint.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+export-abi = []
+
+# Host-side test build: pull alloy-primitives with the pure-Rust tiny-keccak
+# implementation so unit tests don't try to link the `native_keccak256` Stylus
+# hostio that only exists on the wasm32 target.
+[dev-dependencies]
+alloy-primitives = { workspace = true, features = ["tiny-keccak"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
