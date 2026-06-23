@@ -1,0 +1,28 @@
+# XcodeGen spec for the example app. Generate the project with:
+#   brew install xcodegen
+#   cd sdk/ios/Example && xcodegen generate && open P256Example.xcodeproj
+# Then run on a *physical device* (the Simulator has no Secure Enclave).
+name: P256Example
+options:
+  bundleIdPrefix: xyz.heavenlydev
+  deploymentTarget:
+    iOS: "16.0"
+packages:
+  P256Account:
+    path: ".."   # the local Swift package at sdk/ios
+targets:
+  P256Example:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    dependencies:
+      - package: P256Account
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: true
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.heavenlydev.p256example
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_KEY_CFBundleDisplayName: P256 Account
+        INFOPLIST_KEY_NSFaceIDUsageDescription: Authorize transactions with Face ID.
+        INFOPLIST_KEY_UILaunchScreen_Generation: true

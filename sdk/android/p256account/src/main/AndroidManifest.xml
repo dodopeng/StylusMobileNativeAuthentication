@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Network access for the JSON-RPC client / relayer. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- StrongBox is preferred but optional; the signer falls back to TEE. -->
+    <uses-feature
+        android:name="android.hardware.strongbox_keystore"
+        android:required="false" />
+</manifest>

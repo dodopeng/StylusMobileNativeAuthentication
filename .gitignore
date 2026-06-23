@@ -10,3 +10,9 @@ dist/
 .idea/
 foundry.lock
 reports/raw/
+
+local.properties
+.build/
+*.xcodeproj/
+DerivedData/
+xcuserdata/

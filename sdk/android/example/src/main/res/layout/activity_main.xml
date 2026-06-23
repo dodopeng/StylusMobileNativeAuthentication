@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="20dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="P256 Account demo"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:paddingBottom="12dp" />
+
+        <Button
+            android:id="@+id/btnCreateKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="1 · Create / load hardware key" />
+
+        <TextView
+            android:id="@+id/txtPubKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:paddingVertical="8dp"
+            android:text="public key: —" />
+
+        <EditText
+            android:id="@+id/inRpc"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="RPC URL"
+            android:inputType="textUri"
+            android:text="https://sepolia-rollup.arbitrum.io/rpc" />
+
+        <EditText
+            android:id="@+id/inRelay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Relayer URL"
+            android:inputType="textUri"
+            android:text="http://10.0.2.2:8080/relay" />
+
+        <EditText
+            android:id="@+id/inAccount"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Deployed account address (0x…)"
+            android:inputType="text" />
+
+        <Button
+            android:id="@+id/btnSend"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="2 · Sign &amp; relay test execute (biometric)" />
+
+        <TextView
+            android:id="@+id/txtStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:paddingTop="12dp"
+            android:text="status: idle" />
+    </LinearLayout>
+</ScrollView>

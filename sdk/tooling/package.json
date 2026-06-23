@@ -1,0 +1,22 @@
+{
+  "name": "p256account-tooling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference signer, relayer service, and end-to-end harness for the P256Account mobile SDKs.",
+  "scripts": {
+    "relayer": "tsx src/relayer/server.ts",
+    "e2e": "tsx src/e2e/roundtrip.ts",
+    "test": "tsx --test src/reference/interop.test.ts src/relayer/guard.test.ts src/e2e/simulate.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.6.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
