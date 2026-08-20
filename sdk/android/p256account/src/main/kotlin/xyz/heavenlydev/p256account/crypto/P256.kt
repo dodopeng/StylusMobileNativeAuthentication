@@ -18,14 +18,18 @@ data class PublicKeyP256(val x: BigInteger, val y: BigInteger) {
  */
 object P256 {
     /** Field prime p. */
+    @JvmField
     val P = BigInteger("FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF", 16)
     /** Group order n. */
+    @JvmField
     val N = BigInteger("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16)
     /** floor(n/2): strict low-S boundary. */
+    @JvmField
     val HALF_N = N.shiftRight(1)
     private val A = BigInteger("FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC", 16) // -3 mod p
     private val B = BigInteger("5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B", 16)
 
+    @JvmStatic
     fun isOnCurve(x: BigInteger, y: BigInteger): Boolean {
         // y^2 ≡ x^3 + a·x + b (mod p)
         val lhs = y.modPow(BigInteger.TWO, P)
@@ -37,6 +41,7 @@ object P256 {
      * Convert a DER `SEQUENCE { INTEGER r, INTEGER s }` (what Android's
      * `SHA256withECDSA` emits) into a canonical 64-byte `r‖s` with low-S applied.
      */
+    @JvmStatic
     fun derToRawLowS(der: ByteArray): ByteArray {
         val (r, sRaw) = decodeDer(der)
         require(r.signum() > 0 && r < N) { "r out of range (0, n)" }

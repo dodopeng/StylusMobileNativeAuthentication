@@ -16,3 +16,8 @@ local.properties
 *.xcodeproj/
 DerivedData/
 xcuserdata/
+
+# Gradle build output. NOT gradle/wrapper/ or gradlew — the wrapper is
+# committed on purpose so a fresh clone can build without Gradle installed.
+.gradle/
+build/

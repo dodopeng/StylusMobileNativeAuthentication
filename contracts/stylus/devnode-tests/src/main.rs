@@ -725,7 +725,8 @@ fn test_execute_reverting_target_consumes_nonce(ctx: &Ctx) -> Result<()> {
         bail!("Executed.success was true despite the inner call hitting the fallback revert");
     }
 
-    // Nonce must still bump despite inner-call revert — this is the A2 invariant.
+    // Nonce must still bump despite inner-call revert — the nonce-before-call
+    // invariant (SPEC.md §5).
     let new_nonce = cast_call_u256(&acct_str, "nonce()")?;
     let expected = u64_to_u256_be(1);
     if new_nonce != expected {

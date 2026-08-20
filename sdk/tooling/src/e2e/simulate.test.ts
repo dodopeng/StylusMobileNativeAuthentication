@@ -108,7 +108,7 @@ test('rotating to an off-curve key is rejected (anti-brick)', () => {
   assert.throws(() => acct.submit(callData), (e) => e instanceof ContractRevert && /InvalidPublicKey/.test(e.reason))
 })
 
-test('reverting inner call still consumes the nonce (A2 invariant)', () => {
+test('reverting inner call still consumes the nonce (nonce-before-call, SPEC.md §5)', () => {
   const signer = ReferenceSigner.random()
   const acct = freshAccount(signer)
   const txHash = acct.submit(signedExecute(signer, acct, REVERTER))

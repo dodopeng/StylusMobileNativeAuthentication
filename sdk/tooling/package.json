@@ -7,8 +7,12 @@
   "scripts": {
     "relayer": "tsx src/relayer/server.ts",
     "e2e": "tsx src/e2e/roundtrip.ts",
-    "test": "tsx --test src/reference/interop.test.ts src/relayer/guard.test.ts src/e2e/simulate.test.ts",
-    "typecheck": "tsc --noEmit"
+    "e2e:actions": "tsx src/e2e/actions-live.ts",
+    "test": "tsx --test src/reference/interop.test.ts src/reference/actions.test.ts src/relayer/guard.test.ts src/e2e/simulate.test.ts src/e2e/actions.e2e.test.ts",
+    "golden": "scripts/gen-actions-golden.sh",
+    "abi-check": "scripts/check-abi.sh",
+    "typecheck": "tsc --noEmit",
+    "bench": "tsx src/bench/roundtrip-bench.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0",

@@ -1,8 +1,20 @@
 import Foundation
 
+/// The RPC surface `P256AccountClient` depends on.
+///
+/// Extracted so the nonce-reservation logic is testable: a fake can hold the
+/// chain nonce still across several `execute` calls, which is precisely the
+/// state a real chain is in between broadcast and confirmation.
+/// `JSONRPCClient` is the production conformer.
+public protocol AccountRPC {
+    func chainId() async throws -> UInt64
+    func callUint(to: String, data: [UInt8]) async throws -> U256
+    func getTransactionReceipt(_ txHash: String) async throws -> [String: Any]?
+}
+
 /// Tiny Ethereum JSON-RPC client over URLSession. Only the read/broadcast paths
 /// the SDK needs: `eth_call`, `eth_chainId`, `eth_sendRawTransaction`.
-public final class JSONRPCClient {
+public final class JSONRPCClient: AccountRPC {
     private let endpoint: URL
     private let session: URLSession
 

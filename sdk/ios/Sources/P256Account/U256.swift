@@ -31,12 +31,19 @@ public struct U256: Comparable, Equatable {
         self.init(bigEndian: data)
     }
 
-    /// Decimal string → U256 via repeated `*10 + digit` (mod 2^256).
+    /// Decimal string → U256.
+    ///
+    /// Returns `nil` for an empty string, a non-digit, or a value that would
+    /// exceed 2^256 − 1. A parser for user-supplied amounts must not turn
+    /// "too big" into "some other number", so overflow fails rather than wraps.
     public init?(decimal: String) {
+        guard !decimal.isEmpty else { return nil }
         var acc = U256()
         for ch in decimal {
             guard let d = ch.wholeNumberValue, d >= 0, d <= 9 else { return nil }
-            acc = acc.mulSmall(10).addSmall(UInt32(d))
+            guard let stepped = acc.mulSmallChecked(10), let next = stepped.addSmallChecked(UInt32(d))
+            else { return nil }  // overflow past 2^256 - 1
+            acc = next
         }
         self = acc
     }
@@ -50,7 +57,34 @@ public struct U256: Comparable, Equatable {
         return false
     }
 
+    /// `self + other`, saturating at 2^256 − 1 (unreachable for nonces).
+    public func adding(_ other: U256) -> U256 {
+        var out = [UInt8](repeating: 0, count: 32)
+        var carry = 0
+        for i in stride(from: 31, through: 0, by: -1) {
+            let v = Int(bytes[i]) + Int(other.bytes[i]) + carry
+            out[i] = UInt8(v & 0xff)
+            carry = v >> 8
+        }
+        if carry != 0 { return U256.max }
+        // `out` is built as exactly 32 bytes, so this cannot fail.
+        return U256(bigEndian: out)!
+    }
+
+    /// 2^256 − 1, the saturation point for `adding`.
+    public static let max = U256(bigEndian: [UInt8](repeating: 0xff, count: 32))!
+
+    /// `self - other`, or `nil` on underflow.
+    ///
+    /// Prefer this over `subtracting`, which saturates silently.
+    public func subtractingChecked(_ other: U256) -> U256? {
+        self < other ? nil : subtracting(other)
+    }
+
     /// `self - other`, assuming `self >= other` (true for the `n - s` use).
+    ///
+    /// Underflow wraps mod 2^256 rather than trapping. Callers handling
+    /// untrusted values should use `subtractingChecked`.
     public func subtracting(_ other: U256) -> U256 {
         var out = [UInt8](repeating: 0, count: 32)
         var borrow = 0
@@ -83,5 +117,32 @@ public struct U256: Comparable, Equatable {
             if carry == 0 { break }
         }
         return U256(bigEndian: out)!
+    }
+
+    /// `self * m`, or `nil` if the product exceeds 2^256 − 1.
+    func mulSmallChecked(_ m: UInt32) -> U256? {
+        var out = [UInt8](repeating: 0, count: 32)
+        var carry: UInt32 = 0
+        for i in stride(from: 31, through: 0, by: -1) {
+            let v = UInt32(bytes[i]) * m + carry
+            out[i] = UInt8(v & 0xff)
+            carry = v >> 8
+        }
+        guard carry == 0 else { return nil }
+        return U256(bigEndian: out)
+    }
+
+    /// `self + a`, or `nil` on carry out of the top byte.
+    func addSmallChecked(_ a: UInt32) -> U256? {
+        var out = bytes
+        var carry = Int(a)
+        for i in stride(from: 31, through: 0, by: -1) {
+            let v = Int(out[i]) + carry
+            out[i] = UInt8(v & 0xff)
+            carry = v >> 8
+            if carry == 0 { break }
+        }
+        guard carry == 0 else { return nil }
+        return U256(bigEndian: out)
     }
 }

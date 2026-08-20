@@ -63,6 +63,20 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(U256(decimal: "0")!, U256(0))
     }
 
+    func testU256AddingSaturatesInsteadOfWrapping() {
+        // `adding` documents saturation. It previously ended
+        // `U256(bigEndian: out) ?? self` — but `out` is always 32 bytes, so the
+        // initialiser never failed, the fallback was dead, and the carry out of
+        // the top byte was dropped, wrapping to 0 instead of saturating.
+        XCTAssertEqual(U256.max.adding(U256(1)), U256.max)
+        XCTAssertEqual(U256.max.adding(U256.max), U256.max)
+
+        // Ordinary carries still propagate across byte boundaries.
+        XCTAssertEqual(U256(0xff).adding(U256(1)), U256(0x100))
+        XCTAssertEqual(U256(decimal: "18446744073709551615")!.adding(U256(1)),
+                       U256(decimal: "18446744073709551616")!)
+    }
+
     func testOnCurveValidationGuardsAgainstBricking() throws {
         // A real Secure-Enclave-equivalent key (CryptoKit P-256) is on-curve.
         let key = P256.Signing.PrivateKey()

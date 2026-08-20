@@ -25,9 +25,16 @@ public enum Hex {
     }
 
     /// 20-byte address → left-padded 32-byte word.
-    public static func addressWord(_ address: String) -> [UInt8] {
-        let a = toBytes(address) ?? []
-        precondition(a.count == 20, "address must be 20 bytes: \(address)")
+    ///
+    /// - Throws: `P256Error.badAddress` if `address` is not 20 hex bytes.
+    ///
+    /// This used to `precondition`, which traps in release builds too — an
+    /// address pasted by a user or arriving from a deeplink could kill the host
+    /// app. The Kotlin twin throws recoverably; these must match.
+    public static func addressWord(_ address: String) throws -> [UInt8] {
+        guard let a = toBytes(address), a.count == 20 else {
+            throw P256Error.badAddress("address must be 20 hex bytes, got: \(address)")
+        }
         return [UInt8](repeating: 0, count: 12) + a
     }
 }

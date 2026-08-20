@@ -7,7 +7,7 @@ End-to-end integration harness for `P256Account` against a local Nitro devnode. 
 | Test name | Asserts | Verified |
 |---|---|---|
 | `happy_path` | `execute` with valid sig → tx success, nonce `0 → 1`, ETH transferred | ✅ on Nitro `v3.7.1-926f1ab` |
-| `reverting_target_consumes_nonce` | inner-call target reverts → tx still succeeds, nonce still bumps, `Executed.success = false` (the A2 invariant) | ✅ |
+| `reverting_target_consumes_nonce` | inner-call target reverts → tx still succeeds, nonce still bumps, `Executed.success = false` (the nonce-before-call invariant, SPEC.md §5) | ✅ |
 | `value_exceeds_balance` | account funded with 1 wei, `execute` requests transfer of 2 wei → `Executed.success = false`, balance unchanged, nonce still bumps. Pins down stylus-sdk's mapping of insufficient-balance CALL: it's `Err(Revert)` not `Ok(empty)`, so no `vm().balance() >= value` guard is needed in the contract. | ✅ |
 | `rotate_owner` | new key signature verifies, `ownerX` / `ownerY` overwritten on-chain, nonce bumps | ✅ |
 | `nonce_monotonicity` | chained `execute → rotate → execute` with the rotated key; nonce strictly `0 → 1 → 2 → 3` | ✅ |

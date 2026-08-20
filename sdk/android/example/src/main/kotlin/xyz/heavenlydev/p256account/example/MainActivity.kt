@@ -8,6 +8,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import xyz.heavenlydev.p256account.account.BiometricAuth
 import xyz.heavenlydev.p256account.account.Call
+import xyz.heavenlydev.p256account.crypto.Numeric
 import xyz.heavenlydev.p256account.account.P256Account
 import xyz.heavenlydev.p256account.example.databinding.ActivityMainBinding
 import xyz.heavenlydev.p256account.keystore.StrongBoxP256Signer
@@ -76,10 +77,26 @@ class MainActivity : AppCompatActivity() {
         binding.txtStatus.text = "status: signing…"
         lifecycleScope.launch {
             try {
-                // A harmless self-call (0 wei, empty data) — exercises the full
+                // 0 wei, empty data, to a plain address — exercises the full
                 // sign → relay → on-chain path without touching real funds.
-                val txHash = p256.execute(Call(to = account, value = BigInteger.ZERO), auth)
-                binding.txtStatus.text = "status: relayed ✓\n$txHash"
+                //
+                // NOT a self-call: execute(Call(to = account)) re-enters the
+                // account, which the re-entrancy guard rejects, so the demo
+                // would always fail internally while still returning a hash.
+                val txHash = p256.execute(Call(to = BURN_ADDRESS, value = BigInteger.ZERO), auth)
+                binding.txtStatus.text = "status: relayed, waiting for receipt…\n$txHash"
+
+                // A tx hash does NOT mean the action succeeded: the contract
+                // records a failed inner call in Executed and still consumes
+                // the nonce. Decode it before claiming success.
+                val result = p256.awaitExecuted(txHash)
+                binding.txtStatus.text = if (result.success) {
+                    "status: executed ✓\n$txHash"
+                } else {
+                    val revert = if (result.returnData.isEmpty()) "(no revert data)"
+                    else Numeric.bytesToHex(result.returnData)
+                    "status: relayed but the inner call REVERTED ✗\n$txHash\n$revert"
+                }
             } catch (e: Exception) {
                 binding.txtStatus.text = "status: failed — ${e.message}"
             }
@@ -97,3 +114,9 @@ class MainActivity : AppCompatActivity() {
         private const val ALIAS = "p256-account-demo-key"
     }
 }
+
+/**
+ * A plain, un-owned address. A 0-wei call with empty data to a non-contract
+ * always succeeds, which is what makes it a good connectivity probe.
+ */
+private const val BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"

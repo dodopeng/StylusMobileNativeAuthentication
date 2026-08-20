@@ -5,8 +5,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import xyz.heavenlydev.p256account.crypto.Numeric
 import java.math.BigInteger
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
  * A signed, ready-to-broadcast account action. `callData` is the full
@@ -39,18 +37,12 @@ class HttpRelay(private val url: String) : TransactionRelay {
             put("data", Numeric.bytesToHex(action.callData))
             put("nonce", action.nonce.toString())
         }.toString()
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json")
-            connectTimeout = 15_000
-            readTimeout = 30_000
+        val response = Http.postJson(url, body)
+        val json = Http.parse(response, url)
+        Http.errorMessage(json)?.let { throw RpcException(-1, "relayer rejected the action: $it") }
+        if (!json.has("txHash") || json.isNull("txHash")) {
+            throw RpcException(-1, "relayer response has no txHash: '${response.body.take(200)}'")
         }
-        conn.outputStream.use { it.write(body.toByteArray()) }
-        val text = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
-            .bufferedReader().use { it.readText() }
-        val json = JSONObject(text)
-        if (json.has("error")) throw RpcException(-1, json.getString("error"))
         json.getString("txHash")
     }
 }

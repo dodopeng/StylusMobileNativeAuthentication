@@ -41,8 +41,29 @@ val account = P256Account(
 //    Face/fingerprint prompt, then relays.
 val auth = BiometricAuth(activity, biometricPrompt())
 val txHash = account.execute(Erc20.transfer(token = USDC, to = recipient, amount = amount), auth)
-account.execute(UniswapV2.swapExactTokensForTokens(router, amountIn, minOut, listOf(USDC, WETH), account.address, deadline), auth)
 account.rotateOwner(newHardwareKey.publicKey(), auth)
+
+// 3b. Multi-step flows go in ONE batch: one biometric prompt, one nonce, one
+//     signature. Two separate execute calls means two prompts, and because
+//     nonce() reads at *latest* the second is signed against the same nonce and
+//     reverts unless the user waits for the first to confirm. The contract
+//     reverts the whole batch if any call fails, so approve→swap can never
+//     leave a dangling approval.
+account.executeBatch(
+    listOf(
+        Erc20.approve(token = USDC, spender = router, amount = amountIn),
+        UniswapV2.swapExactTokensForTokens(
+            router, amountIn, minOut, listOf(USDC, WETH), account.address, deadline,
+        ),
+    ),
+    auth,
+)
+
+// 3c. Sign an off-chain challenge (Permit2, Seaport, a login) that a dApp
+//     verifies via the account's EIP-1271 isValidSignature. The hash is wrapped
+//     in PersonalSign(bytes32) before signing — never signed raw, or an
+//     `execute` digest could be passed off as a login challenge.
+val signature = account.signHash(challengeHash, auth)
 
 // A tx hash does NOT mean the inner action succeeded — the contract returns
 // (success, returnData) without reverting. Confirm the real outcome:
@@ -69,16 +90,28 @@ p256account/src/main/kotlin/xyz/heavenlydev/p256account/
   abi/       Abi encoder + keccak-derived selectors
   rpc/       JsonRpcClient, TransactionRelay (HttpRelay / BroadcasterRelay)
   account/   P256Account, SignProvider, Call
-  action/    Erc20 · Erc721 · UniswapV2 · AaveV3 templates (Milestone 4)
+  action/    Native · Erc20 · Erc721 · Weth · UniswapV2 · AaveV3 templates
+             (Milestone 4 — 16 templates, see ../ACTIONS.md)
 ```
 
 ## Build & test
 
+Requires **JDK 17** and an **Android SDK** with platform 34 (`ANDROID_HOME` set,
+or `sdk.dir` in `local.properties`). Gradle itself does not need to be
+installed — the committed wrapper fetches the pinned version on first run.
+
 ```bash
 cd sdk/android
-./gradlew :p256account:testDebugUnitTest   # runs InteropTest (golden vectors)
-./gradlew :p256account:assembleRelease      # builds the .aar
+./gradlew :p256account:testDebugUnitTest   # InteropTest + ActionsInteropTest + SoftwareSignerTest
+./gradlew :p256account:assembleRelease     # builds the .aar
 ```
+
+The wrapper pins **Gradle 8.9** (matching AGP 8.5.2) and verifies the downloaded
+distribution against the SHA-256 published at
+[gradle.org/release-checksums](https://gradle.org/release-checksums/), so a
+tampered or truncated download is rejected rather than executed. The
+`gradle-wrapper.jar` is the official artifact from the `v8.9.0` release tag;
+its checksum matches the published *Wrapper JAR Checksum* for 8.9.
 
 > The example app referenced in the milestone deliverables is a thin
 > `FragmentActivity` wrapper around the Quick start above; the SDK surface and

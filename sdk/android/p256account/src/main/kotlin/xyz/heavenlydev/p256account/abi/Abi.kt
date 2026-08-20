@@ -11,6 +11,13 @@ sealed interface AbiValue {
     data class DynBytes(val value: ByteArray) : AbiValue
     /** Fixed `address[]` for swap paths etc. */
     data class AddressArray(val values: List<String>) : AbiValue
+    /** `bool`, encoded as a right-aligned 0/1 word (ERC-721 `setApprovalForAll`). */
+    data class Bool(val value: Boolean) : AbiValue
+    /** `uint256[]` — batch call values. */
+    data class UintArray(val values: List<BigInteger>) : AbiValue
+    /** `bytes[]` — batch calldata. Doubly dynamic: an offset table into
+     *  individually length-prefixed, right-padded elements. */
+    data class BytesArray(val values: List<ByteArray>) : AbiValue
 }
 
 /**
@@ -20,12 +27,15 @@ sealed interface AbiValue {
  */
 object Abi {
     /** `bytes4(keccak256(signature))`, e.g. `selector("transfer(address,uint256)")`. */
+    @JvmStatic
     fun selector(signature: String): ByteArray =
         Keccak256.digest(signature.toByteArray(Charsets.US_ASCII)).copyOfRange(0, 4)
 
+    @JvmStatic
     fun encodeWithSelector(signature: String, args: List<AbiValue>): ByteArray =
         encode(selector(signature), args)
 
+    @JvmStatic
     fun encode(selector: ByteArray, args: List<AbiValue>): ByteArray {
         val head = ArrayList<ByteArray>(args.size)
         val tail = ArrayList<ByteArray>()
@@ -36,6 +46,9 @@ object Abi {
             when (arg) {
                 is AbiValue.Address -> head.add(Numeric.addressWord(arg.value))
                 is AbiValue.Uint -> head.add(Numeric.toUint256(arg.value))
+                is AbiValue.Bool -> head.add(
+                    Numeric.toUint256(if (arg.value) BigInteger.ONE else BigInteger.ZERO),
+                )
                 is AbiValue.DynBytes -> {
                     head.add(Numeric.toUint256(BigInteger.valueOf(tailOffset.toLong())))
                     val enc = encodeDynBytes(arg.value)
@@ -44,6 +57,16 @@ object Abi {
                 is AbiValue.AddressArray -> {
                     head.add(Numeric.toUint256(BigInteger.valueOf(tailOffset.toLong())))
                     val enc = encodeAddressArray(arg.values)
+                    tail.add(enc); tailOffset += enc.size
+                }
+                is AbiValue.UintArray -> {
+                    head.add(Numeric.toUint256(BigInteger.valueOf(tailOffset.toLong())))
+                    val enc = encodeUintArray(arg.values)
+                    tail.add(enc); tailOffset += enc.size
+                }
+                is AbiValue.BytesArray -> {
+                    head.add(Numeric.toUint256(BigInteger.valueOf(tailOffset.toLong())))
+                    val enc = encodeBytesArray(arg.values)
                     tail.add(enc); tailOffset += enc.size
                 }
             }
@@ -63,6 +86,32 @@ object Abi {
         Numeric.toUint256(BigInteger.valueOf(value.size.toLong())).copyInto(out, 0)
         value.copyInto(out, 32)
         return out
+    }
+
+    private fun encodeUintArray(values: List<BigInteger>): ByteArray {
+        val out = ByteArray(32 + values.size * 32)
+        Numeric.toUint256(BigInteger.valueOf(values.size.toLong())).copyInto(out, 0)
+        var off = 32
+        for (v in values) { Numeric.toUint256(v).copyInto(out, off); off += 32 }
+        return out
+    }
+
+    /**
+     * `bytes[]`: count, then a word-offset per element (relative to the start of
+     * the offset table), then each element length-prefixed and right-padded.
+     */
+    private fun encodeBytesArray(values: List<ByteArray>): ByteArray {
+        val bodies = values.map { encodeDynBytes(it) }
+        val offsetTable = values.size * 32
+        val out = java.io.ByteArrayOutputStream()
+        out.write(Numeric.toUint256(BigInteger.valueOf(values.size.toLong())))
+        var cursor = offsetTable
+        for (b in bodies) {
+            out.write(Numeric.toUint256(BigInteger.valueOf(cursor.toLong())))
+            cursor += b.size
+        }
+        for (b in bodies) out.write(b)
+        return out.toByteArray()
     }
 
     private fun encodeAddressArray(values: List<String>): ByteArray {

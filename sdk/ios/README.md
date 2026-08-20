@@ -38,10 +38,26 @@ let account = P256AccountClient(
 
 // 3. Do things — each call triggers Face ID (the enclave shows it), then relays.
 let txHash = try await account.execute(Erc20.transfer(token: usdc, to: recipient, amount: U256(decimal: "1000000")!))
-try await account.execute(UniswapV2.swapExactTokensForTokens(
-    router: router, amountIn: amt, amountOutMin: minOut, path: [usdc, weth],
-    to: account.address, deadline: U256(deadline)))
 try await account.rotateOwner(to: try newSigner.create())
+
+// 3b. Multi-step flows go in ONE batch: one Face ID prompt, one nonce, one
+//     signature. Two separate `execute` calls means two prompts, and because
+//     `nonce()` reads at *latest* the second is signed against the same nonce
+//     and reverts unless the user waits for the first to confirm. The contract
+//     reverts the whole batch if any call fails, so approve→swap can never
+//     leave a dangling approval.
+try await account.executeBatch([
+    Erc20.approve(token: usdc, spender: router, amount: amt),
+    UniswapV2.swapExactTokensForTokens(
+        router: router, amountIn: amt, amountOutMin: minOut, path: [usdc, weth],
+        to: account.address, deadline: U256(deadline)),
+])
+
+// 3c. Sign an off-chain challenge (Permit2, Seaport, a login) that a dApp
+//     verifies through the account's EIP-1271 `isValidSignature`. The hash is
+//     wrapped in `PersonalSign(bytes32)` before signing — never signed raw, or
+//     an `execute` digest could be passed off as a login challenge.
+let signature = try await account.signHash(challengeHash)
 
 // 4. A tx hash does NOT mean the inner action succeeded — the contract returns
 //    (success, returnData) without reverting. Confirm the real outcome:
@@ -71,7 +87,8 @@ Sources/P256Account/
   ABI.swift                ABI encoder + keccak-derived selectors
   JSONRPC.swift / Relay.swift  RPC client + HTTPRelay / BroadcasterRelay
   P256Account.swift        P256AccountClient, Call
-  Actions.swift            Erc20 · Erc721 · UniswapV2 · AaveV3 (Milestone 4)
+  Actions.swift            Native · Erc20 · Erc721 · Weth · UniswapV2 · AaveV3
+                           (Milestone 4 — 16 templates, see ../ACTIONS.md)
 Tests/P256AccountTests/    InteropTests (golden vectors, parity with Android)
 ```
 

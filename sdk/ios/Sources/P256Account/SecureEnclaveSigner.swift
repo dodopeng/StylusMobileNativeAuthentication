@@ -3,9 +3,36 @@ import Security
 import LocalAuthentication
 
 /// Produces a canonical 64-byte `r‖s` (low-S) signature over a 32-byte digest.
+/// Low-level signing primitive.
+///
+/// - Warning: **Never pass a hash you did not construct.** `sign` puts the
+///   hardware key over the given 32 bytes verbatim, with no domain separation.
+///   An `Execute` digest is itself a 32-byte hash whose inputs are all public,
+///   so signing caller-supplied bytes here reproduces exactly the EIP-1271
+///   vulnerability that `PersonalSign` wrapping was added to close: an attacker
+///   hands you an `execute(to: attacker, value: 1 ETH)` digest as a "challenge"
+///   and the result is a valid transfer authorisation.
+///
+///   For EIP-1271 challenges use `P256AccountClient.signHash(_:)`, which applies
+///   the `PersonalSign(bytes32 hash)` wrapper. Use this protocol directly only
+///   for digests the SDK itself built.
 public protocol SignProvider {
     func publicKey() throws -> PublicKeyP256
+    /// Sign 32 bytes verbatim. See the type-level warning before calling this
+    /// with anything that came from outside your own code.
     func sign(digest: [UInt8]) async throws -> [UInt8]
+    /// Sign with a caller-supplied `LAContext` so integrators can set prompt
+    /// copy (`localizedReason`), reuse an already-authenticated context, or
+    /// control reuse duration — the parity of Android's `BiometricAuth`.
+    /// Signers without an auth UI ignore `context`.
+    func sign(digest: [UInt8], context: LAContext?) async throws -> [UInt8]
+}
+
+public extension SignProvider {
+    /// Default: ignore the context. Software signers use this as-is.
+    func sign(digest: [UInt8], context: LAContext?) async throws -> [UInt8] {
+        try await sign(digest: digest)
+    }
 }
 
 /// Hardware-backed P-256 signer using the **Secure Enclave**. The private key
@@ -103,6 +130,11 @@ public final class SecureEnclaveSigner: SignProvider {
     /// `SignProvider` conformance with a default `LAContext`.
     public func sign(digest: [UInt8]) async throws -> [UInt8] {
         try await sign(digest: digest, context: LAContext())
+    }
+
+    /// Honour a caller-supplied context, falling back to a fresh one.
+    public func sign(digest: [UInt8], context: LAContext?) async throws -> [UInt8] {
+        try await sign(digest: digest, context: context ?? LAContext())
     }
 
     // MARK: - Internals

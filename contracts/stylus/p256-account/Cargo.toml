@@ -7,22 +7,25 @@ edition = "2021"
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 stylus-sdk.workspace = true
-ruint.workspace = true
 
 [lib]
 crate-type = ["lib", "cdylib"]
 
 [features]
-export-abi = []
+# Must forward to the SDK: without it the generated `print_from_args` is absent
+# and `cargo stylus export-abi` fails to link.
+export-abi = ["stylus-sdk/export-abi"]
 
 # Host-side test build: pull alloy-primitives with the pure-Rust tiny-keccak
 # implementation so unit tests don't try to link the `native_keccak256` Stylus
 # hostio that only exists on the wasm32 target.
 [dev-dependencies]
 alloy-primitives = { workspace = true, features = ["tiny-keccak"] }
+# stylus-sdk 0.9.0 declares `reentrant = [... "stylus-test/reentrant"]` without
+# the `?`, so enabling `reentrant` implicitly turns on the OPTIONAL `stylus-test`
+# dependency. On non-wasm targets that drags in alloy-provider -> alloy-consensus
+# 0.11.1, which references `serde::__private` — removed in newer serde. The wasm
+# build is unaffected (stylus-test is cfg(not(wasm32))); only the host test build
+# breaks. Pin serde to the last version alloy-consensus 0.11.1 compiles against.
+serde = "=1.0.217"
 
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-panic = "abort"

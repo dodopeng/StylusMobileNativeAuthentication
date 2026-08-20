@@ -8,8 +8,11 @@ round-trip** harness that drives the full sign → relay → on-chain pipeline.
 ```bash
 cd sdk/tooling
 npm install
-npm test         # 9 tests: golden-vector parity + a real P-256 sign→verify + relayer guards
+npm test         # 55 tests: golden-vector parity, a real P-256 sign→verify,
+                 # relayer guards, action-template goldens + template e2e
 npm run typecheck
+npm run golden   # regenerate sdk/actions.golden.json via foundry `cast`
+npm run e2e:actions   # run the template catalog against a deployed account
 ```
 
 ## Reference signer (`src/reference/`)

@@ -59,27 +59,53 @@ public enum P256Curve {
         return [UInt8](r.data) + [UInt8](s.data)
     }
 
+    /// DER `SEQUENCE { INTEGER r, INTEGER s }` → `(r, s)`.
+    ///
+    /// Every read is bounds-checked. This parses bytes that arrive from outside
+    /// the SDK (a hardware signer, but also anything an integrator passes in),
+    /// and in Swift an out-of-range slice is a **fatal trap, not a throw** — it
+    /// kills the host app. Nothing in here may index without checking first.
     private static func decodeDER(_ der: [UInt8]) throws -> ([UInt8], [UInt8]) {
         var i = 0
-        guard i < der.count, der[i] == 0x30 else { throw P256Error.badSignature("no SEQUENCE") }
-        i += 1
-        i = skipLength(der, i)
-        guard i < der.count, der[i] == 0x02 else { throw P256Error.badSignature("no INTEGER r") }
-        i += 1
-        let rLen = Int(der[i]); i += 1
-        let r = stripSign(Array(der[i..<i + rLen])); i += rLen
-        guard i < der.count, der[i] == 0x02 else { throw P256Error.badSignature("no INTEGER s") }
-        i += 1
-        let sLen = Int(der[i]); i += 1
-        let s = stripSign(Array(der[i..<i + sLen]))
-        return (r, s)
-    }
 
-    private static func skipLength(_ der: [UInt8], _ start: Int) -> Int {
-        var i = start
-        let first = Int(der[i]); i += 1
-        if first & 0x80 != 0 { i += first & 0x7f } // long form
-        return i
+        func byte() throws -> UInt8 {
+            guard i < der.count else { throw P256Error.badSignature("truncated DER") }
+            defer { i += 1 }
+            return der[i]
+        }
+
+        func take(_ n: Int) throws -> [UInt8] {
+            guard n >= 0, i + n <= der.count else { throw P256Error.badSignature("truncated DER") }
+            defer { i += n }
+            return Array(der[i..<i + n])
+        }
+
+        /// DER length: short form, or long form with a 1–4 byte big-endian count.
+        func length() throws -> Int {
+            let first = Int(try byte())
+            if first & 0x80 == 0 { return first }
+            let count = first & 0x7f
+            guard count >= 1, count <= 4 else { throw P256Error.badSignature("bad DER length") }
+            var value = 0
+            for _ in 0..<count { value = (value << 8) | Int(try byte()) }
+            guard value >= 0 else { throw P256Error.badSignature("bad DER length") }
+            return value
+        }
+
+        func integer() throws -> [UInt8] {
+            guard try byte() == 0x02 else { throw P256Error.badSignature("expected INTEGER") }
+            let len = try length()
+            guard len > 0 else { throw P256Error.badSignature("empty INTEGER") }
+            return stripSign(try take(len))
+        }
+
+        guard try byte() == 0x30 else { throw P256Error.badSignature("no SEQUENCE") }
+        let seqLen = try length()
+        guard i + seqLen <= der.count else { throw P256Error.badSignature("SEQUENCE overruns buffer") }
+
+        let r = try integer()
+        let s = try integer()
+        return (r, s)
     }
 
     /// Drop a leading 0x00 sign byte that DER adds when the high bit is set.
@@ -93,6 +119,11 @@ public enum P256Curve {
 public enum P256Error: Error, Equatable {
     case badSignature(String)
     case badPublicKey(String)
+    /// A malformed address reached an encoder. Recoverable — the Swift SDK
+    /// used to `precondition` here, which killed the host app.
+    case badAddress(String)
+    /// A receipt or log payload could not be decoded.
+    case badReceipt(String)
     case keystore(String)
     case rpc(String)
 }

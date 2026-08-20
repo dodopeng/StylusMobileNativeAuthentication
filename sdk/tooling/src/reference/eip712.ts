@@ -57,6 +57,56 @@ export function executeDigest(args: {
   return envelope(args.chainId, args.account, structHash)
 }
 
+const BATCH_TYPEHASH =
+  '0xe4c4e9c11a8826c10f239085bcd6b1f837ac8891ef69510451fb4e86df1ff4fb' as const
+const CALL_TYPEHASH =
+  '0x9085b19ea56248c94d86174b3784cfaaa8673d1041d6441f61ff52752dac8483' as const
+const PERSONAL_SIGN_TYPEHASH =
+  '0x2431bd832cbb131f8882ef79f68ed6ae065cca9270f5bce0f2e4f75a9cd814b7' as const
+
+export interface BatchCall { to: Address; value: bigint; data: Hex }
+
+/** EIP-712 digest for `executeBatch`. Order is part of the hash. */
+export function batchDigest(args: {
+  chainId: bigint
+  account: Address
+  calls: readonly BatchCall[]
+  nonce: bigint
+}): Hex {
+  const callHashes = args.calls.map((c) =>
+    keccak256(concatHex([CALL_TYPEHASH, pad(c.to, { size: 32 }), word(c.value), keccak256(c.data)])),
+  )
+  const callsHash = keccak256(concatHex(callHashes))
+  const structHash = keccak256(concatHex([BATCH_TYPEHASH, callsHash, word(args.nonce)]))
+  return envelope(args.chainId, args.account, structHash)
+}
+
+/**
+ * EIP-712 digest for an EIP-1271 challenge: `PersonalSign(bytes32 hash)`.
+ *
+ * The 1271 path must NOT sign the raw hash — an `Execute` digest is itself a
+ * 32-byte hash computable from public inputs, so raw signing turns a login
+ * prompt into a transfer authorisation.
+ */
+export function personalSignDigest(args: {
+  chainId: bigint
+  account: Address
+  hash: Hex
+}): Hex {
+  const structHash = keccak256(concatHex([PERSONAL_SIGN_TYPEHASH, args.hash]))
+  return envelope(args.chainId, args.account, structHash)
+}
+
+export function encodeExecuteBatch(
+  calls: readonly BatchCall[], nonce: bigint, signature: Hex,
+): Hex {
+  return encodeFunctionData({
+    abi: ACCOUNT_ABI,
+    functionName: 'executeBatch',
+    args: [calls.map((c) => c.to), calls.map((c) => c.value), calls.map((c) => c.data), nonce, signature],
+  })
+}
+
 export function rotateDigest(args: {
   chainId: bigint
   account: Address
@@ -105,7 +155,9 @@ export { encodeAbiParameters }
 export const ACCOUNT_ABI = [
   { type: 'constructor', stateMutability: 'nonpayable', inputs: [
     { name: 'x', type: 'uint256' }, { name: 'y', type: 'uint256' } ] },
-  { type: 'function', name: 'execute', stateMutability: 'payable', inputs: [
+  // NOT payable — the contract deliberately isn't, and check-abi.sh asserts it.
+  // This said 'payable' and directly contradicted that assertion.
+  { type: 'function', name: 'execute', stateMutability: 'nonpayable', inputs: [
     { name: 'to', type: 'address' }, { name: 'value', type: 'uint256' },
     { name: 'data', type: 'bytes' }, { name: 'nonce', type: 'uint256' },
     { name: 'signature', type: 'bytes' } ],
@@ -118,4 +170,22 @@ export const ACCOUNT_ABI = [
   { type: 'function', name: 'ownerY', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'isValidSignature', stateMutability: 'view', inputs: [
     { name: 'hash', type: 'bytes32' }, { name: 'signature', type: 'bytes' } ], outputs: [{ type: 'bytes4' }] },
+  { type: 'function', name: 'executeBatch', stateMutability: 'nonpayable', inputs: [
+    { name: 'to', type: 'address[]' }, { name: 'value', type: 'uint256[]' },
+    { name: 'data', type: 'bytes[]' }, { name: 'nonce', type: 'uint256' },
+    { name: 'signature', type: 'bytes' } ], outputs: [] },
+  { type: 'function', name: 'supportsInterface', stateMutability: 'view', inputs: [
+    { name: 'interfaceId', type: 'bytes4' } ], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'onERC721Received', stateMutability: 'nonpayable', inputs: [
+    { name: 'operator', type: 'address' }, { name: 'from', type: 'address' },
+    { name: 'tokenId', type: 'uint256' }, { name: 'data', type: 'bytes' } ],
+    outputs: [{ type: 'bytes4' }] },
+  { type: 'function', name: 'onERC1155Received', stateMutability: 'nonpayable', inputs: [
+    { name: 'operator', type: 'address' }, { name: 'from', type: 'address' },
+    { name: 'id', type: 'uint256' }, { name: 'value', type: 'uint256' },
+    { name: 'data', type: 'bytes' } ], outputs: [{ type: 'bytes4' }] },
+  { type: 'function', name: 'onERC1155BatchReceived', stateMutability: 'nonpayable', inputs: [
+    { name: 'operator', type: 'address' }, { name: 'from', type: 'address' },
+    { name: 'ids', type: 'uint256[]' }, { name: 'values', type: 'uint256[]' },
+    { name: 'data', type: 'bytes' } ], outputs: [{ type: 'bytes4' }] },
 ] as const

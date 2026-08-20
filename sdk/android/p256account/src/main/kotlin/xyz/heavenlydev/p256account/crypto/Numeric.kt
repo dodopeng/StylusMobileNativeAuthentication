@@ -4,6 +4,7 @@ import java.math.BigInteger
 
 /** Hex / 32-byte word helpers shared by the ABI encoder and EIP-712 hashing. */
 object Numeric {
+    @JvmStatic
     fun hexToBytes(hex: String): ByteArray {
         val s = hex.removePrefix("0x").removePrefix("0X")
         val clean = if (s.length % 2 == 1) "0$s" else s
@@ -14,6 +15,8 @@ object Numeric {
         return out
     }
 
+    @JvmStatic
+    @JvmOverloads
     fun bytesToHex(bytes: ByteArray, prefix: Boolean = true): String {
         val sb = StringBuilder(bytes.size * 2 + 2)
         if (prefix) sb.append("0x")
@@ -25,6 +28,7 @@ object Numeric {
     }
 
     /** Left-pad an unsigned big-endian value to a 32-byte EVM word. */
+    @JvmStatic
     fun toUint256(value: BigInteger): ByteArray {
         require(value.signum() >= 0) { "uint256 must be non-negative" }
         val raw = value.toByteArray() // may have a leading 0x00 sign byte
@@ -36,6 +40,7 @@ object Numeric {
     }
 
     /** Encode an address as a left-padded 32-byte word. */
+    @JvmStatic
     fun addressWord(address: String): ByteArray {
         val bytes = hexToBytes(address)
         require(bytes.size == 20) { "address must be 20 bytes: $address" }
@@ -44,6 +49,7 @@ object Numeric {
         return out
     }
 
+    @JvmStatic
     fun toBigInteger(word: ByteArray): BigInteger = BigInteger(1, word)
 
     private val HEX = "0123456789abcdef".toCharArray()

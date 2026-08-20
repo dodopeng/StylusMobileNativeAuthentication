@@ -15,6 +15,8 @@ import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
@@ -101,19 +103,53 @@ class StrongBoxP256Signer(
         val auth = requireNotNull(auth) {
             "this signer requires a biometric; pass BiometricAuth(activity, promptInfo) to execute()/rotateOwner()"
         }
-        val authed = suspendCancellableCoroutine<Signature> { cont ->
-            val executor = androidx.core.content.ContextCompat.getMainExecutor(auth.activity)
-            val prompt = BiometricPrompt(auth.activity, executor, object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    val s = result.cryptoObject?.signature
-                    if (s == null) cont.resumeWithException(IllegalStateException("no Signature in CryptoObject"))
-                    else cont.resume(s)
+        val authed = withContext(Dispatchers.Main.immediate) {
+            // BiometricPrompt.authenticate() MUST be called on the main thread.
+            // `sign` is an ordinary suspend fun, so a caller on Dispatchers.IO
+            // (the natural place to do crypto) would otherwise crash here.
+            suspendCancellableCoroutine<Signature> { cont ->
+                val executor = androidx.core.content.ContextCompat.getMainExecutor(auth.activity)
+                // BiometricPrompt can deliver a second callback — notably an
+                // error after a success — and resuming a continuation twice
+                // throws IllegalStateException. Latch it.
+                val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+                val prompt = BiometricPrompt(
+                    auth.activity,
+                    executor,
+                    object : BiometricPrompt.AuthenticationCallback() {
+                        override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                            if (!settled.compareAndSet(false, true)) return
+                            val s = result.cryptoObject?.signature
+                            if (s == null) {
+                                cont.resumeWithException(
+                                    IllegalStateException("no Signature in CryptoObject"),
+                                )
+                            } else {
+                                cont.resume(s)
+                            }
+                        }
+
+                        override fun onAuthenticationError(code: Int, msg: CharSequence) {
+                            if (!settled.compareAndSet(false, true)) return
+                            cont.resumeWithException(BiometricSignException(code, msg.toString()))
+                        }
+                    },
+                )
+
+                // If the calling coroutine is cancelled (screen closed, user
+                // navigated away) the prompt would otherwise stay on screen
+                // with nothing listening to it.
+                cont.invokeOnCancellation {
+                    settled.set(true)
+                    // invokeOnCancellation runs on the canceller's thread, which
+                    // is usually NOT the main thread; BiometricPrompt requires
+                    // main. Hop explicitly rather than relying on the caller.
+                    executor.execute { prompt.cancelAuthentication() }
                 }
-                override fun onAuthenticationError(code: Int, msg: CharSequence) {
-                    cont.resumeWithException(BiometricSignException(code, msg.toString()))
-                }
-            })
-            prompt.authenticate(auth.promptInfo, BiometricPrompt.CryptoObject(signature))
+
+                prompt.authenticate(auth.promptInfo, BiometricPrompt.CryptoObject(signature))
+            }
         }
         authed.update(digest)
         return P256.derToRawLowS(authed.sign())

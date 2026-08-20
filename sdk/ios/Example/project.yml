@@ -20,9 +20,28 @@ targets:
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1"
-        GENERATE_INFOPLIST_FILE: true
         PRODUCT_BUNDLE_IDENTIFIER: xyz.heavenlydev.p256example
         CODE_SIGN_STYLE: Automatic
-        INFOPLIST_KEY_CFBundleDisplayName: P256 Account
-        INFOPLIST_KEY_NSFaceIDUsageDescription: Authorize transactions with Face ID.
-        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        # NOTE: the INFOPLIST_KEY_* build settings only apply when
+        # GENERATE_INFOPLIST_FILE is on. This target ships an explicit
+        # Info.plist (below) so ATS can be configured, which means every key
+        # must live in that block — an INFOPLIST_KEY_* here would be silently
+        # ignored. CFBundleDisplayName was lost exactly that way.
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: P256 Account
+        NSFaceIDUsageDescription: Authorize transactions with Face ID.
+        UILaunchScreen: {}
+        # App Transport Security blocks cleartext HTTP on a real device, so a
+        # relayer reached over plain http:// fails AFTER Face ID succeeds — the
+        # demo looks like a signing bug when it is a networking policy.
+        # This exception is scoped to local development addresses only; a
+        # production app should use https and delete this block entirely.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+            127.0.0.1:
+              NSExceptionAllowsInsecureHTTPLoads: true

@@ -33,6 +33,7 @@ object Keccak256 {
     )
     private const val RATE = 136 // bytes (1088 bits)
 
+    @JvmStatic
     fun digest(input: ByteArray): ByteArray {
         val state = LongArray(25)
         // pad10*1 with Keccak's 0x01 first byte (not SHA3's 0x06)

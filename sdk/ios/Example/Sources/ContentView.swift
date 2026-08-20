@@ -12,9 +12,17 @@ import P256Account
 struct ContentView: View {
     @State private var pubKey = "—"
     @State private var rpc = "https://sepolia-rollup.arbitrum.io/rpc"
+    // NOTE: `localhost` is the PHONE, not your Mac. On a physical device
+    // (required — the Simulator has no Secure Enclave) point this at your
+    // machine's LAN address, e.g. http://192.168.1.20:8080/relay, and keep the
+    // ATS exception in project.yml. Prefer https in anything shipped.
     @State private var relayURL = "http://localhost:8080/relay"
     @State private var account = ""
     @State private var status = "idle"
+
+    /// A plain, un-owned address. A 0-wei call with empty data to a non-contract
+    /// always succeeds, which is what makes it a good connectivity probe.
+    private let burnAddress = "0x000000000000000000000000000000000000dEaD"
 
     // Secure Enclave on a real device; a software key on the Simulator (which
     // has no enclave) so the demo still runs. Both are SignProviders.
@@ -70,10 +78,27 @@ struct ContentView: View {
         let relay = HTTPRelay(url: relayURL)
         let client = P256AccountClient(address: account, rpc: rpcClient, relay: relay, signer: signer)
         do {
-            // A harmless self-call (0 wei, empty data) exercises the full
+            // 0 wei, empty data, to a plain address — exercises the full
             // sign → relay → on-chain path without touching real funds.
-            let txHash = try await client.execute(Call(to: account))
-            status = "relayed ✓\n\(txHash)"
+            //
+            // NOT a self-call: `execute(Call(to: account))` re-enters the
+            // account, which the re-entrancy guard rejects, so the demo would
+            // always fail internally while still returning a tx hash.
+            let txHash = try await client.execute(Call(to: burnAddress))
+            status = "relayed, waiting for receipt…\n\(txHash)"
+
+            // A tx hash does NOT mean the action succeeded: `execute` records a
+            // failed inner call in the Executed event and still consumes the
+            // nonce. Decode it before claiming success.
+            let result = try await client.awaitExecuted(txHash: txHash)
+            if result.success {
+                status = "executed ✓\n\(txHash)"
+            } else {
+                let revert = result.returnData.isEmpty
+                    ? "(no revert data)"
+                    : Hex.toString(result.returnData)
+                status = "relayed but the inner call REVERTED ✗\n\(txHash)\n\(revert)"
+            }
         } catch {
             status = "failed — \(error)"
         }

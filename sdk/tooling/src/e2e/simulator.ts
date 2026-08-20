@@ -20,7 +20,7 @@ import {
   type Address,
   type Hex,
 } from 'viem'
-import { ACCOUNT_ABI, executeDigest, rotateDigest } from '../reference/eip712.ts'
+import { ACCOUNT_ABI, executeDigest, rotateDigest, batchDigest } from '../reference/eip712.ts'
 
 const N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n
 const HALF_N = N >> 1n
@@ -29,6 +29,9 @@ const P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn
 /** A `to` address the simulator treats as a reverting inner call (for the
  *  contract's "revert still consumes the nonce" invariant). */
 export const REVERTER: Address = '0x000000000000000000000000000000000000dead'
+
+/** Mirrors the contract's MAX_BATCH_CALLS. */
+export const MAX_BATCH_CALLS = 32
 
 export interface ExecutedResult {
   success: boolean
@@ -73,6 +76,10 @@ export class SimulatedAccount {
     let result: ExecutedResult
     if (functionName === 'execute') {
       result = this.execute(args as readonly [Address, bigint, Hex, bigint, Hex])
+    } else if (functionName === 'executeBatch') {
+      result = this.executeBatch(
+        args as readonly [readonly Address[], readonly bigint[], readonly Hex[], bigint, Hex],
+      )
     } else if (functionName === 'rotateOwner') {
       result = this.rotateOwner(args as readonly [bigint, bigint, bigint, Hex])
     } else {
@@ -101,6 +108,39 @@ export class SimulatedAccount {
     // (success=false, revertBytes) rather than reverting the whole tx.
     if (to.toLowerCase() === REVERTER.toLowerCase()) {
       return { success: false, returnData: '0xdeadbeef', nonce }
+    }
+    return { success: true, returnData: '0x', nonce }
+  }
+
+  /**
+   * Mirror of `execute_batch`. Unlike `execute`, a batch is ALL-OR-NOTHING: a
+   * failing inner call reverts the whole transaction and the nonce is NOT
+   * consumed, so no partial state (e.g. a dangling approval) survives.
+   */
+  private executeBatch(
+    args: readonly [readonly Address[], readonly bigint[], readonly Hex[], bigint, Hex],
+  ): ExecutedResult {
+    const [to, value, data, nonce, signature] = args
+    if (to.length === 0 || to.length !== value.length || to.length !== data.length) {
+      throw new ContractRevert(`InvalidBatch(${to.length}, ${value.length}, ${data.length})`)
+    }
+    if (to.length > MAX_BATCH_CALLS) {
+      throw new ContractRevert(`InvalidBatch(${to.length}, ${value.length}, ${data.length})`)
+    }
+    if (nonce !== this._nonce) {
+      throw new ContractRevert(`NonceMismatch(expected ${this._nonce}, got ${nonce})`)
+    }
+    const calls = to.map((t, i) => ({ to: t, value: value[i], data: data[i] }))
+    const digest = batchDigest({ chainId: this.chainId, account: this.address, calls, nonce })
+    this.verify(digest, signature)
+
+    this._nonce += 1n
+    for (let i = 0; i < to.length; i++) {
+      if (to[i].toLowerCase() === REVERTER.toLowerCase()) {
+        // All-or-nothing: undo the nonce bump, as an on-chain revert would.
+        this._nonce -= 1n
+        throw new ContractRevert(`BatchCallFailed(${i})`)
+      }
     }
     return { success: true, returnData: '0x', nonce }
   }

@@ -9,9 +9,13 @@
 //! - 64-byte signature `(r ‖ s)`.
 //! - `r` must lie in `(0, n)` (curve order); `s` must lie in `(0, n/2]` (strict
 //!   low-S to block malleability).
-//! - The hash signed is an EIP-712 envelope so a P-256 signature on an
-//!   `Execute(...)` typed struct cannot collide with an arbitrary 32-byte
-//!   challenge presented via EIP-1271, and vice versa.
+//! - Every signable message is an EIP-712 envelope over a **distinct typehash**:
+//!   `Execute`, `BatchExecute`, `RotateOwner`, and `PersonalSign` (the EIP-1271
+//!   challenge wrapper). Domain separation alone is not enough — it was not,
+//!   while `isValidSignature` verified the raw hash, because an `Execute` digest
+//!   is itself a 32-byte hash that an attacker can compute from public inputs
+//!   and present as a login challenge. Wrapping the 1271 path in its own
+//!   typehash is what actually makes the domains disjoint.
 //!
 //! ## EIP-712 domain
 //! ```text
@@ -33,12 +37,14 @@
 //! deploy --constructor-signature 'constructor(uint256,uint256)'`. There is no
 //! window between code activation and owner-key set.
 //!
-//! ## Off-curve risk
-//! The constructor accepts any `(x, y)` with each component in `(0, p)`. A
-//! malformed point (not on the curve) deploys successfully but every signature
-//! verification thereafter will fail — the account is bricked. The mobile SDK
-//! MUST derive `(x, y)` from a real secure-enclave key. The contract does not
-//! perform full curve-membership math by design (C1).
+//! ## Curve membership
+//! Public keys are validated for full curve membership — `y² ≡ x³ − 3x + b
+//! (mod p)` — in both the constructor and `rotate_owner`, not merely
+//! range-checked. An off-curve point would deploy or rotate successfully and
+//! then make every subsequent signature unverifiable, permanently bricking the
+//! account. Three modular multiplications is a cheap price for removing a
+//! footgun whose blast radius is the whole account, so the earlier
+//! range-check-only design (C1) has been replaced.
 
 #![cfg_attr(not(any(test, feature = "export-abi")), no_main)]
 extern crate alloc;
@@ -46,14 +52,29 @@ extern crate alloc;
 use alloc::vec::Vec;
 use alloy_primitives::{b256, Address, FixedBytes, B256, U256};
 use alloy_sol_types::sol;
+// `stylus_sdk::call::{call, Call, Error}` are deprecated in 0.9.0 in favour of
+// `stylus_core::calls::*` reached through `self.vm()`. That migration does not
+// compile here: `Call::new_in(self)` holds `&mut self` for the context's
+// lifetime while `self.vm()` needs `&self`, so the two borrows conflict
+// (E0502). The SDK is pinned at =0.9.0, the deprecated path is still the
+// supported one at that version, and this is the contract's only external-call
+// site — so the warning is silenced deliberately and locally rather than left
+// as noise or worked around with an unsafe rewrite of the call path.
+// Revisit when the SDK pin moves.
+#[allow(deprecated)]
 use stylus_sdk::{
     abi::Bytes,
-    call::{self, Call, RawCall},
+    call::{self, Call},
     crypto::keccak,
     prelude::*,
-    storage::StorageU256,
+    storage::{StorageBool, StorageU256},
     ArbResult,
 };
+// Only the non-test `precompile_staticcall` issues the raw STATICCALL; under
+// `cfg(test)` that function is replaced by the shim, so an unconditional import
+// is an unused-import warning in every test build.
+#[cfg(not(test))]
+use stylus_sdk::call::RawCall;
 
 // =====================================================================
 // Constants
@@ -77,6 +98,13 @@ const P256_ORDER_N: [u8; 32] = [
     0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
 ];
 
+/// P-256 curve coefficient `b` in `y² = x³ − 3x + b (mod p)`.
+/// `0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B`.
+const P256_B: [u8; 32] = [
+    0x5A, 0xC6, 0x35, 0xD8, 0xAA, 0x3A, 0x93, 0xE7, 0xB3, 0xEB, 0xBD, 0x55, 0x76, 0x98, 0x86, 0xBC,
+    0x65, 0x1D, 0x06, 0xB0, 0xCC, 0x53, 0xB0, 0xF6, 0x3B, 0xCE, 0x3C, 0x3E, 0x27, 0xD2, 0x60, 0x4B,
+];
+
 /// `floor(n / 2)` — strict low-S boundary against signature malleability.
 const P256_HALF_ORDER: [u8; 32] = [
     0x7F, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -97,6 +125,42 @@ const EXECUTE_TYPEHASH: B256 =
 /// `keccak256("RotateOwner(uint256 newX,uint256 newY,uint256 nonce)")`.
 const ROTATE_TYPEHASH: B256 =
     b256!("8f4436f69e71ad0ae17d640b65201039c4d90422d319e1151cf92d223086b47a");
+
+/// `keccak256("BatchExecute(Call[] calls,uint256 nonce)Call(address to,uint256 value,bytes data)")`.
+/// Per EIP-712 the referenced `Call` type is appended to the primary type.
+const BATCH_TYPEHASH: B256 =
+    b256!("e4c4e9c11a8826c10f239085bcd6b1f837ac8891ef69510451fb4e86df1ff4fb");
+
+/// `keccak256("PersonalSign(bytes32 hash)")`.
+///
+/// EIP-1271 challenges are wrapped in this struct before verification. Without
+/// it, `isValidSignature` verified the RAW 32-byte hash — and an `Execute`
+/// digest is itself a raw 32-byte hash computable from public inputs. An
+/// attacker could hand the user an `execute(to: attacker, value: 1 ETH)` digest
+/// as a "login challenge"; the 64 bytes returned were a valid `execute`
+/// authorisation. Wrapping makes the two domains disjoint by construction
+/// instead of by convention.
+const PERSONAL_SIGN_TYPEHASH: B256 =
+    b256!("2431bd832cbb131f8882ef79f68ed6ae065cca9270f5bce0f2e4f75a9cd814b7");
+
+/// `keccak256("Call(address to,uint256 value,bytes data)")` — the member type
+/// hashed once per element of `BatchExecute.calls`.
+const CALL_TYPEHASH: B256 =
+    b256!("9085b19ea56248c94d86174b3784cfaaa8673d1041d6441f61ff52752dac8483");
+
+/// `bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`.
+const ERC721_RECEIVED_MAGIC: [u8; 4] = [0x15, 0x0b, 0x7a, 0x02];
+
+/// `bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))`.
+const ERC1155_RECEIVED_MAGIC: [u8; 4] = [0xf2, 0x3a, 0x6e, 0x61];
+
+/// `bytes4(keccak256("onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"))`.
+const ERC1155_BATCH_RECEIVED_MAGIC: [u8; 4] = [0xbc, 0x19, 0x7c, 0x81];
+
+/// Upper bound on calls in a single `execute_batch`. Prevents a signed batch
+/// from being large enough to exceed the block gas limit in a way that makes
+/// the consumed nonce unrecoverable.
+const MAX_BATCH_CALLS: usize = 32;
 
 /// `keccak256("P256Account")` — EIP-712 domain `name`.
 const NAME_HASH: B256 = b256!("0b72970e1618929986bf5a7d529c51922dac77346c4b37b8a99a57436d812f1d");
@@ -125,6 +189,11 @@ sol! {
         bool success,
         bytes returnData
     );
+    /// Emitted once per successful `executeBatch`, after every inner call has
+    /// run. A batch is all-or-nothing, so this only ever appears on the success
+    /// path — a failure reverts the transaction (and these logs with it) and is
+    /// reported through the `BatchCallFailed(index, returnData)` error instead.
+    event BatchExecuted(uint256 calls, uint256 nonce);
     /// Emitted on successful `rotate_owner`. Carries both keys so indexers
     /// don't have to walk history, plus the consumed nonce so this can be
     /// ordered against `Executed` events in the shared monotonic nonce space.
@@ -158,6 +227,24 @@ sol! {
     error HighS();
     #[derive(Debug)]
     error UnknownSelector();
+    /// A nested `execute` / `executeBatch` / `rotateOwner` was attempted while
+    /// one was already on the stack. Plain `receive()` callbacks are allowed —
+    /// blocking those is what broke every ETH-returning action.
+    #[derive(Debug)]
+    error Reentrancy();
+    /// `executeBatch` was given mismatched array lengths, no calls at all, or
+    /// more than `MAX_BATCH_CALLS`.
+    #[derive(Debug)]
+    error InvalidBatch(uint64 calls, uint64 values, uint64 datas);
+    /// An inner call in `executeBatch` reverted. Carries the 0-based index and
+    /// the callee's revert payload.
+    ///
+    /// A batch reverts as a whole, which discards the `Executed` logs emitted
+    /// for the calls that did run — so without this error there was no way to
+    /// learn WHICH call failed. Returning `InvalidSignature` (as this used to)
+    /// was actively misleading: the signature was fine.
+    #[derive(Debug)]
+    error BatchCallFailed(uint256 index, bytes returnData);
 }
 
 #[derive(SolidityError, Debug)]
@@ -170,6 +257,9 @@ pub enum P256AccountError {
     NonceMismatch(NonceMismatch),
     HighS(HighS),
     UnknownSelector(UnknownSelector),
+    Reentrancy(Reentrancy),
+    InvalidBatch(InvalidBatch),
+    BatchCallFailed(BatchCallFailed),
 }
 
 // =====================================================================
@@ -181,8 +271,19 @@ pub enum P256AccountError {
 pub struct P256Account {
     owner_x: StorageU256,
     owner_y: StorageU256,
-    /// Monotonic nonce shared by `execute` and `rotate_owner`.
+    /// Monotonic nonce shared by `execute`, `execute_batch` and `rotate_owner`.
     nonce: StorageU256,
+    /// Re-entrancy guard. Set for the duration of an authorised call so that a
+    /// callback cannot start a second one.
+    ///
+    /// The contract is built with stylus-sdk's `reentrant` feature because the
+    /// account MUST accept being called back: WETH.withdraw and any swap ending
+    /// in ETH send value to the account, invoking `receive()` while `execute` is
+    /// still on the stack. The blanket non-reentrant build reverts those, which
+    /// silently breaks every ETH-returning action. This flag restores the part
+    /// of that protection that actually matters — no nested authorised call —
+    /// while leaving `receive()` free.
+    in_call: StorageBool,
 }
 
 // =====================================================================
@@ -197,9 +298,9 @@ impl P256Account {
     /// only run once per deployed instance, removing the front-running
     /// window that an explicit `init` would have.
     ///
-    /// Validates each pubkey component lies in `(0, p)`. Full on-curve
-    /// membership is not verified here — see the crate-level note on the
-    /// off-curve risk.
+    /// Validates each pubkey component lies in `(0, p)` **and** that `(x, y)` is
+    /// on the P-256 curve. A point that is merely in range but off-curve would
+    /// deploy fine and then reject every signature forever.
     #[constructor]
     pub fn constructor(&mut self, x: U256, y: U256) -> Result<(), P256AccountError> {
         validate_constructor_args(x, y)?;
@@ -249,14 +350,17 @@ impl P256Account {
         data: Bytes,
         nonce: U256,
         signature: Bytes,
-    ) -> Result<(bool, Vec<u8>), P256AccountError> {
+    ) -> Result<(bool, Bytes), P256AccountError> {
+        self.enter()?;
+
         let chain_id = self.vm().chain_id();
         let account = self.vm().contract_address();
         let current_nonce = self.nonce.get();
         let owner_x = self.owner_x.get();
         let owner_y = self.owner_y.get();
 
-        validate_execute_request(&ExecuteRequest {
+        // A rejected request must not leave the guard latched.
+        if let Err(e) = validate_execute_request(&ExecuteRequest {
             owner_x,
             owner_y,
             current_nonce,
@@ -267,11 +371,15 @@ impl P256Account {
             data: data.as_ref(),
             nonce,
             signature: signature.as_ref(),
-        })?;
+        }) {
+            self.exit();
+            return Err(e);
+        }
 
         // CEI: commit nonce before the external call.
         self.nonce.set(current_nonce + U256::from(1));
 
+        #[allow(deprecated)]
         let call_result = call::call(Call::new_in(self).value(value), to, data.as_ref());
         let (success, return_data) = execute_outcome(call_result);
 
@@ -286,21 +394,129 @@ impl P256Account {
             },
         );
 
-        Ok((success, return_data))
+        self.exit();
+        // `Vec<u8>` would export as `uint8[]`; SPEC.md §3 and every SDK expect
+        // `bytes`.
+        Ok((success, return_data.into()))
+    }
+
+    /// Execute several calls under a **single** P-256 signature and a single
+    /// nonce.
+    ///
+    /// This is what makes multi-step DeFi usable on mobile. `approve` then
+    /// `swap` as two separate `execute` calls needs two biometric prompts and
+    /// two nonces, and because the client reads `nonce()` at *latest* it will
+    /// sign both against the same value and the second reverts unless the user
+    /// waits for the first to confirm. One batch is one prompt, one nonce, and
+    /// no race.
+    ///
+    /// ## All-or-nothing
+    /// Unlike single `execute` — which records an inner revert in `Executed`
+    /// and still consumes the nonce — a batch **reverts entirely** if any call
+    /// fails. A half-applied `approve`/`swap` is worse than none, and the
+    /// caller signed for the whole sequence, not a prefix of it. The nonce is
+    /// therefore not consumed on failure.
+    ///
+    /// Arrays are parallel: `to[i]`, `value[i]`, `data[i]`. All three must be
+    /// the same non-zero length, at most `MAX_BATCH_CALLS`.
+    ///
+    /// Deliberately NOT `#[payable]`, matching `execute`. The inner calls are
+    /// funded from the account's own balance via `value[i]`, which IS covered by
+    /// the signature; an attached `msg.value` would not be, so accepting one
+    /// would mean moving unsigned value through a signed entry point. Fund the
+    /// account through `receive()` instead.
+    pub fn execute_batch(
+        &mut self,
+        to: Vec<Address>,
+        value: Vec<U256>,
+        data: Vec<Bytes>,
+        nonce: U256,
+        signature: Bytes,
+    ) -> Result<(), P256AccountError> {
+        self.enter()?;
+
+        if let Err(e) = validate_batch_shape(to.len(), value.len(), data.len()) {
+            self.exit();
+            return Err(e);
+        }
+
+        let chain_id = self.vm().chain_id();
+        let account = self.vm().contract_address();
+        let current_nonce = self.nonce.get();
+        let owner_x = self.owner_x.get();
+        let owner_y = self.owner_y.get();
+
+        let data_refs: Vec<&[u8]> = data.iter().map(|d| d.as_ref()).collect();
+        let batch_hash = compute_batch_hash(chain_id, account, &to, &value, &data_refs, nonce);
+
+        if let Err(e) = validate_authorised_hash(
+            batch_hash,
+            current_nonce,
+            nonce,
+            owner_x,
+            owner_y,
+            signature.as_ref(),
+        ) {
+            self.exit();
+            return Err(e);
+        }
+
+        self.nonce.set(current_nonce + U256::from(1));
+
+        for i in 0..to.len() {
+            #[allow(deprecated)]
+            let result = call::call(Call::new_in(self).value(value[i]), to[i], data_refs[i]);
+            let (success, return_data) = execute_outcome(result);
+
+            log(
+                self.vm(),
+                Executed {
+                    to: to[i],
+                    value: value[i],
+                    nonce,
+                    success,
+                    returnData: return_data.clone().into(),
+                },
+            );
+
+            if !success {
+                // Revert the whole batch, undoing the nonce bump and every
+                // prior call in this transaction. The revert discards the
+                // `Executed` logs above, so the index and payload are carried
+                // in the error itself — otherwise a failed batch is undebuggable.
+                self.exit();
+                return Err(P256AccountError::BatchCallFailed(BatchCallFailed {
+                    index: U256::from(i),
+                    returnData: return_data.into(),
+                }));
+            }
+        }
+
+        log(
+            self.vm(),
+            BatchExecuted {
+                calls: U256::from(to.len()),
+                nonce,
+            },
+        );
+
+        self.exit();
+        Ok(())
     }
 
     /// Rotate the owner key. The caller must provide a P-256 signature from
     /// the *current* owner over the EIP-712 `RotateOwner` struct. Shares the
     /// monotonic nonce with `execute`.
     ///
-    /// ## Off-curve risk on rotation
-    /// The contract validates only that each component of the new key lies
-    /// in `(0, p)`. The new `(new_x, new_y)` is NOT checked for curve
-    /// membership. A current owner who rotates to an off-curve point will
-    /// **permanently brick** the account — no future signature will verify
-    /// and no further rotation can be authorised. The mobile SDK is
-    /// responsible for ensuring the rotation target is a real
-    /// secure-enclave key, matching the constructor's contract.
+    /// ## Curve membership on rotation
+    /// `(new_x, new_y)` is checked for full curve membership, not just range.
+    /// An off-curve target would **permanently brick** the account — no future
+    /// signature could verify and no further rotation could be authorised — so
+    /// this is enforced on-chain rather than delegated to client-side care.
+    ///
+    /// On-curve is necessary but not sufficient: a key that is a valid curve
+    /// point yet not backed by the enclave is still an unrecoverable loss of
+    /// control. The SDK remains responsible for that half.
     pub fn rotate_owner(
         &mut self,
         new_x: U256,
@@ -308,13 +524,15 @@ impl P256Account {
         nonce: U256,
         signature: Bytes,
     ) -> Result<(), P256AccountError> {
+        self.enter()?;
+
         let chain_id = self.vm().chain_id();
         let account = self.vm().contract_address();
         let current_nonce = self.nonce.get();
         let owner_x = self.owner_x.get();
         let owner_y = self.owner_y.get();
 
-        validate_rotation_request(&RotationRequest {
+        if let Err(e) = validate_rotation_request(&RotationRequest {
             owner_x,
             owner_y,
             current_nonce,
@@ -324,7 +542,10 @@ impl P256Account {
             new_y,
             nonce,
             signature: signature.as_ref(),
-        })?;
+        }) {
+            self.exit();
+            return Err(e);
+        }
 
         self.nonce.set(current_nonce + U256::from(1));
         self.owner_x.set(new_x);
@@ -339,6 +560,7 @@ impl P256Account {
                 nonce,
             },
         );
+        self.exit();
         Ok(())
     }
 
@@ -358,26 +580,104 @@ impl P256Account {
     /// EIP-1271 signature check. Returns `0x1626ba7e` on success, all-zeros
     /// otherwise. Never reverts.
     ///
-    /// Because the `hash` here is supplied by the caller (typically a dApp
-    /// presenting an arbitrary 32-byte challenge) it could in principle
-    /// collide with the preimage of an `execute` hash — except that
-    /// `compute_execute_hash` is the keccak of an EIP-712 envelope starting
-    /// with `\x19\x01 ‖ domainSeparator`, which a dApp-supplied challenge
-    /// cannot reproduce without already controlling the construction. The
-    /// EIP-1271 path is therefore safe against `execute` replay.
+    /// The `hash` is caller-supplied, so it is verified against
+    /// `PersonalSign(hash)` — its own EIP-712 typed domain — never raw. See
+    /// `PERSONAL_SIGN_TYPEHASH` for why raw verification was exploitable.
     pub fn is_valid_signature(&self, hash: B256, signature: Bytes) -> FixedBytes<4> {
-        FixedBytes::new(eip1271_response(self.verify(hash, signature)))
+        // PersonalSign(hash), never the raw hash — see PERSONAL_SIGN_TYPEHASH.
+        let wrapped = compute_personal_sign_hash(
+            self.vm().chain_id(),
+            self.vm().contract_address(),
+            hash,
+        );
+        let ok = validate_p256_signature(
+            wrapped,
+            signature.as_ref(),
+            self.owner_x.get(),
+            self.owner_y.get(),
+        )
+        .is_ok();
+        FixedBytes::new(eip1271_response(ok))
     }
 
-    /// Reverts on any unknown selector. Stylus dispatches empty calldata to
-    /// `#[receive]`, so anything that reaches this handler is a non-empty
-    /// unrecognised call — refuse it to avoid ABI-probing false positives
-    /// and to surface integration bugs in callers.
+    /// ERC-721 safe-transfer acceptance. Without this every `safeTransferFrom`
+    /// **into** the account reverts (the fallback rejects unknown selectors),
+    /// which would make an account that ships ERC-721 action templates unable
+    /// to receive the very tokens those templates move.
     ///
-    /// Note: `#[fallback]` returns `ArbResult` (= `Result<Vec<u8>, Vec<u8>>`)
-    /// because Solidity fallback semantics permit returning data;
-    /// `#[receive]` returns `Result<(), Vec<u8>>` because receive has no
-    /// return value by convention. The asymmetry is intentional.
+    /// Unconditional acceptance is deliberate: refusing here cannot protect the
+    /// owner from unwanted tokens (a plain `transferFrom` bypasses the hook
+    /// entirely) and would only break legitimate marketplace and mint flows.
+    ///
+    /// The `#[selector]` override is load-bearing: stylus-proc renders
+    /// `on_erc721_received` as `onErc721Received` (selector `0x5ca688d3`), but
+    /// ERC-721 calls `onERC721Received` (`0x150b7a02`). Without this the hook is
+    /// never reached, the fallback rejects the transfer, and the account still
+    /// cannot receive NFTs — silently, because no selector in our own ABI moved.
+    #[selector(name = "onERC721Received")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_erc721_received(
+        &mut self,
+        _operator: Address,
+        _from: Address,
+        _token_id: U256,
+        _data: Bytes,
+    ) -> FixedBytes<4> {
+        FixedBytes(ERC721_RECEIVED_MAGIC)
+    }
+
+    /// ERC-1155 single-transfer acceptance. Same rationale as the ERC-721 hook,
+    /// including the selector override.
+    #[selector(name = "onERC1155Received")]
+    pub fn on_erc1155_received(
+        &mut self,
+        _operator: Address,
+        _from: Address,
+        _id: U256,
+        _value: U256,
+        _data: Bytes,
+    ) -> FixedBytes<4> {
+        FixedBytes(ERC1155_RECEIVED_MAGIC)
+    }
+
+    /// ERC-1155 batch-transfer acceptance.
+    #[selector(name = "onERC1155BatchReceived")]
+    pub fn on_erc1155_batch_received(
+        &mut self,
+        _operator: Address,
+        _from: Address,
+        _ids: Vec<U256>,
+        _values: Vec<U256>,
+        _data: Bytes,
+    ) -> FixedBytes<4> {
+        FixedBytes(ERC1155_BATCH_RECEIVED_MAGIC)
+    }
+
+    /// ERC-165. Advertises ERC-165 itself, EIP-1271, and both token receiver
+    /// interfaces so marketplaces and bridges can detect support before
+    /// attempting a safe transfer.
+    pub fn supports_interface(&self, interface_id: FixedBytes<4>) -> bool {
+        let id: [u8; 4] = interface_id.0;
+        id == [0x01, 0xff, 0xc9, 0xa7]      // ERC-165
+            || id == EIP1271_MAGIC           // EIP-1271 isValidSignature
+            || id == ERC721_RECEIVED_MAGIC   // ERC721TokenReceiver
+            || id == [0x4e, 0x23, 0x12, 0xe0] // ERC1155TokenReceiver
+    }
+
+    /// Reverts on any unknown selector.
+    ///
+    /// Stylus dispatches empty calldata to `#[receive]`, so anything reaching
+    /// this handler is a non-empty unrecognised call — refuse it, to avoid
+    /// ABI-probing false positives and to surface integration bugs in callers.
+    ///
+    /// `fallback` reverts with `UnknownSelector` while `receive` accepts ETH
+    /// silently: a bare value transfer is a legitimate way to fund the account,
+    /// whereas calldata the account does not implement is a caller mistake that
+    /// should surface. The asymmetry is intentional.
+    ///
+    /// Note the differing return types: `#[fallback]` returns `ArbResult`
+    /// (= `Result<Vec<u8>, Vec<u8>>`) because Solidity fallback semantics permit
+    /// returning data, whereas `#[receive]` returns `Result<(), Vec<u8>>`.
     #[payable]
     #[fallback]
     pub fn fallback(&mut self, _input: &[u8]) -> ArbResult {
@@ -390,6 +690,34 @@ impl P256Account {
     #[receive]
     pub fn receive(&mut self) -> Result<(), Vec<u8>> {
         Ok(())
+    }
+}
+
+// =====================================================================
+// Re-entrancy guard
+// =====================================================================
+
+impl P256Account {
+    /// Latch the guard, or reject if an authorised call is already on the stack.
+    ///
+    /// This is NOT a substitute for the nonce: the nonce prevents replay across
+    /// transactions, the guard prevents a callee from starting a second
+    /// authorised call *within* one. Both are needed once `reentrant` is on.
+    fn enter(&mut self) -> Result<(), P256AccountError> {
+        if self.in_call.get() {
+            return Err(P256AccountError::Reentrancy(Reentrancy {}));
+        }
+        self.in_call.set(true);
+        Ok(())
+    }
+
+    /// Release the guard. Must run on every exit path, including error paths —
+    /// a latched guard left behind would brick the account for the rest of the
+    /// transaction. Reverting paths unwind storage anyway, but `execute`
+    /// returns `Ok` with `success = false` for a failed inner call, and that
+    /// path does not unwind.
+    fn exit(&mut self) {
+        self.in_call.set(false);
     }
 }
 
@@ -435,7 +763,7 @@ struct RotationRequest<'a> {
 }
 
 fn validate_constructor_args(x: U256, y: U256) -> Result<(), P256AccountError> {
-    if !is_valid_pubkey_component(x) || !is_valid_pubkey_component(y) {
+    if !is_valid_pubkey(x, y) {
         return Err(P256AccountError::InvalidPublicKey(InvalidPublicKey {}));
     }
     Ok(())
@@ -459,7 +787,9 @@ fn validate_rotation_request(r: &RotationRequest<'_>) -> Result<(), P256AccountE
             got: r.nonce,
         }));
     }
-    if !is_valid_pubkey_component(r.new_x) || !is_valid_pubkey_component(r.new_y) {
+    // Full curve membership, not just range: an off-curve rotation target
+    // permanently bricks the account.
+    if !is_valid_pubkey(r.new_x, r.new_y) {
         return Err(P256AccountError::InvalidPublicKey(InvalidPublicKey {}));
     }
     let hash = compute_rotate_hash(r.chain_id, r.account, r.new_x, r.new_y, r.nonce);
@@ -467,9 +797,13 @@ fn validate_rotation_request(r: &RotationRequest<'_>) -> Result<(), P256AccountE
 }
 
 /// Maps the `call::call` result onto the public `(success, return_data)`
-/// shape that `execute` returns. The A2 invariant — nonce is committed
-/// *before* this is called — is enforced structurally at the call site in
-/// `execute`; this helper exists so the mapping itself is unit-testable.
+/// shape that `execute` returns.
+///
+/// The nonce-before-call invariant (SPEC.md §5) — the nonce is committed
+/// *before* this is reached, so a reverting inner call still consumes it — is
+/// enforced structurally at the call site in `execute`. This helper exists so
+/// the mapping itself is unit-testable.
+#[allow(deprecated)]
 fn execute_outcome(call_result: Result<Vec<u8>, call::Error>) -> (bool, Vec<u8>) {
     match call_result {
         Ok(bytes) => (true, bytes),
@@ -610,6 +944,94 @@ mod test_precompile {
 
 /// EIP-712 domain separator:
 /// `keccak256(DOMAIN_TYPEHASH ‖ NAME_HASH ‖ VERSION_HASH ‖ chainId ‖ this)`.
+/// Batch shape validation, split out so it is unit-testable off-chain.
+fn validate_batch_shape(
+    to_len: usize,
+    value_len: usize,
+    data_len: usize,
+) -> Result<(), P256AccountError> {
+    if to_len == 0
+        || to_len != value_len
+        || to_len != data_len
+        || to_len > MAX_BATCH_CALLS
+    {
+        return Err(P256AccountError::InvalidBatch(InvalidBatch {
+            calls: to_len as u64,
+            values: value_len as u64,
+            datas: data_len as u64,
+        }));
+    }
+    Ok(())
+}
+
+/// Shared nonce + signature check for an already-computed authorisation hash.
+/// `execute` / `rotate_owner` build their hash inside their own validators;
+/// batch uses this directly because its hash needs the full call array.
+fn validate_authorised_hash(
+    hash: B256,
+    current_nonce: U256,
+    nonce: U256,
+    owner_x: U256,
+    owner_y: U256,
+    signature: &[u8],
+) -> Result<(), P256AccountError> {
+    if nonce != current_nonce {
+        return Err(P256AccountError::NonceMismatch(NonceMismatch {
+            expected: current_nonce,
+            got: nonce,
+        }));
+    }
+    validate_p256_signature(hash, signature, owner_x, owner_y)
+}
+
+/// EIP-712 hash of `PersonalSign(bytes32 hash)` — the EIP-1271 message domain.
+///
+/// Binds an arbitrary challenge into this account's domain (chainId +
+/// verifyingContract) under a typehash that no authorisation path uses, so a
+/// signature produced for a 1271 challenge cannot be replayed as `execute`,
+/// `executeBatch` or `rotateOwner`, and vice versa.
+fn compute_personal_sign_hash(chain_id: u64, account: Address, hash: B256) -> B256 {
+    let mut struct_buf = [0u8; 64];
+    struct_buf[0..32].copy_from_slice(PERSONAL_SIGN_TYPEHASH.as_slice());
+    struct_buf[32..64].copy_from_slice(hash.as_slice());
+    let struct_hash = keccak(struct_buf);
+    eip712_envelope(chain_id, account, struct_hash)
+}
+
+/// EIP-712 hash of `BatchExecute(Call[] calls,uint256 nonce)`.
+///
+/// Per EIP-712, an array member hashes to `keccak256` of the concatenated
+/// `hashStruct` of each element, and each `Call` hashes as
+/// `keccak256(CALL_TYPEHASH || to || value || keccak256(data))`.
+fn compute_batch_hash(
+    chain_id: u64,
+    account: Address,
+    to: &[Address],
+    value: &[U256],
+    data: &[&[u8]],
+    nonce: U256,
+) -> B256 {
+    let mut concatenated = Vec::with_capacity(to.len() * 32);
+    for i in 0..to.len() {
+        let data_hash = keccak(data[i]);
+        let mut call_buf = [0u8; 128];
+        call_buf[0..32].copy_from_slice(CALL_TYPEHASH.as_slice());
+        call_buf[44..64].copy_from_slice(to[i].as_slice());
+        call_buf[64..96].copy_from_slice(&value[i].to_be_bytes::<32>());
+        call_buf[96..128].copy_from_slice(data_hash.as_slice());
+        concatenated.extend_from_slice(keccak(call_buf).as_slice());
+    }
+    let calls_hash = keccak(&concatenated);
+
+    let mut struct_buf = [0u8; 96];
+    struct_buf[0..32].copy_from_slice(BATCH_TYPEHASH.as_slice());
+    struct_buf[32..64].copy_from_slice(calls_hash.as_slice());
+    struct_buf[64..96].copy_from_slice(&nonce.to_be_bytes::<32>());
+    let struct_hash = keccak(struct_buf);
+
+    eip712_envelope(chain_id, account, struct_hash)
+}
+
 fn compute_domain_separator(chain_id: u64, account: Address) -> B256 {
     let mut buf = [0u8; 160];
     buf[0..32].copy_from_slice(DOMAIN_TYPEHASH.as_slice());
@@ -685,11 +1107,38 @@ fn is_valid_scalar(c: U256) -> bool {
     c != U256::ZERO && c < U256::from_be_bytes(P256_ORDER_N)
 }
 
-/// Coarse pubkey-component sanity: `c ∈ (0, p)`. Off-curve points are NOT
-/// rejected here (see crate-level docs); the RIP-7212 precompile rejects
-/// them at signature-check time.
+/// Field-element range check: `c ∈ (0, p)`. Necessary but not sufficient —
+/// pair it with [`is_on_curve`].
 fn is_valid_pubkey_component(c: U256) -> bool {
     c != U256::ZERO && c < U256::from_be_bytes(P256_FIELD_PRIME)
+}
+
+/// Full curve-membership test: `y² ≡ x³ − 3x + b (mod p)`.
+///
+/// Range-checking `(x, y)` is not enough on its own: an off-curve owner
+/// deploys fine and then makes every future signature unverifiable — a
+/// **permanent, unrecoverable brick**. Three modular multiplications is a cheap
+/// price for a footgun whose blast radius is the entire account. Do not drop
+/// this in favour of the range check alone.
+///
+/// The subtraction is done as `+ (p − 3x)`, which cannot underflow because
+/// `3x mod p < p`.
+fn is_on_curve(x: U256, y: U256) -> bool {
+    let p = U256::from_be_bytes(P256_FIELD_PRIME);
+    let b = U256::from_be_bytes(P256_B);
+
+    let y2 = y.mul_mod(y, p);
+    let x3 = x.mul_mod(x, p).mul_mod(x, p);
+    let three_x = x.mul_mod(U256::from(3), p);
+    let rhs = x3.add_mod(p - three_x, p).add_mod(b, p);
+
+    y2 == rhs
+}
+
+/// A public key is usable iff both components are in range AND the point is on
+/// the curve.
+fn is_valid_pubkey(x: U256, y: U256) -> bool {
+    is_valid_pubkey_component(x) && is_valid_pubkey_component(y) && is_on_curve(x, y)
 }
 
 // =====================================================================
@@ -1078,15 +1527,20 @@ mod tests {
     }
 
     #[test]
+    // Same SDK-0.9.0 deprecation as the import above: constructing the variant
+    // is the only way to exercise `execute_outcome`'s revert arm at this pin.
+    #[allow(deprecated)]
     fn execute_outcome_maps_revert_to_failure_carrying_bytes() {
         let revert = alloc::vec![0xDE, 0xAD, 0xBE, 0xEF];
         let r = execute_outcome(Err(call::Error::Revert(revert.clone())));
-        // Critical: success = false but the revert bytes are preserved so
-        // the SDK can surface them — closes finding #12.
+        // Critical: success = false but the revert bytes are preserved, so the
+        // SDK can surface the target's revert reason instead of a bare failure.
+        // Dropping them here would make every failed inner call indistinguishable.
         assert_eq!(r, (false, revert));
     }
 
     #[test]
+    #[allow(deprecated)]
     fn execute_outcome_preserves_empty_revert_bytes() {
         // Some reverts carry no data (e.g. `revert()` with no message).
         let r = execute_outcome(Err(call::Error::Revert(Vec::new())));
@@ -1154,17 +1608,23 @@ mod tests {
 
     #[test]
     fn constructor_accepts_in_range_pubkey() {
-        assert!(validate_constructor_args(U256::from(1), U256::from(2)).is_ok());
+        // Must be a real curve point now that membership is verified.
+        assert!(validate_constructor_args(u(GX), u(GY)).is_ok());
+        // In range but NOT on the curve — accepted before curve membership was
+        // enforced, and it would have deployed a permanently bricked account.
         let p_minus_1 = U256::from_be_bytes(P256_FIELD_PRIME) - U256::from(1);
-        assert!(validate_constructor_args(p_minus_1, p_minus_1).is_ok());
+        assert!(matches!(
+            validate_constructor_args(p_minus_1, p_minus_1),
+            Err(P256AccountError::InvalidPublicKey(_))
+        ));
     }
 
     // ---- execute request validation ----
 
     fn fixture_execute_request<'a>(sig: &'a [u8]) -> ExecuteRequest<'a> {
         ExecuteRequest {
-            owner_x: U256::from(1),
-            owner_y: U256::from(2),
+            owner_x: u(GX),
+            owner_y: u(GY),
             current_nonce: U256::ZERO,
             chain_id: 42161,
             account: Address::from([0x11; 20]),
@@ -1236,13 +1696,13 @@ mod tests {
 
     fn fixture_rotation_request<'a>(sig: &'a [u8]) -> RotationRequest<'a> {
         RotationRequest {
-            owner_x: U256::from(1),
-            owner_y: U256::from(2),
+            owner_x: u(GX),
+            owner_y: u(GY),
             current_nonce: U256::ZERO,
             chain_id: 42161,
             account: Address::from([0x11; 20]),
-            new_x: U256::from(3),
-            new_y: U256::from(4),
+            new_x: u(G2X),
+            new_y: u(G2Y),
             nonce: U256::ZERO,
             signature: sig,
         }
@@ -1311,8 +1771,11 @@ mod tests {
         let mut req = fixture_rotation_request(&sig);
         req.owner_x = U256::from(0xCAFEu64);
         req.owner_y = U256::from(0xBEEFu64);
-        req.new_x = U256::from(0x1111u64);
-        req.new_y = U256::from(0x2222u64);
+        // The rotation TARGET must be a real curve point; the current owner is
+        // not curve-checked here (this test is about which key reaches the
+        // precompile), so it stays an arbitrary sentinel.
+        req.new_x = u(G2X);
+        req.new_y = u(G2Y);
         validate_rotation_request(&req).unwrap();
         let seen = test_precompile::last_input().unwrap();
         // bytes [96..128] of the precompile input = x; [128..160] = y
@@ -1377,5 +1840,434 @@ mod tests {
         assert_eq!(&seen[64..96], s.to_be_bytes::<32>().as_slice());
         assert_eq!(&seen[96..128], x.to_be_bytes::<32>().as_slice());
         assert_eq!(&seen[128..160], y.to_be_bytes::<32>().as_slice());
+    }
+
+    // -----------------------------------------------------------------
+    // Batch execute (EIP-712 + shape validation)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn batch_typehash_matches_string() {
+        let expected = keccak(
+            b"BatchExecute(Call[] calls,uint256 nonce)Call(address to,uint256 value,bytes data)"
+                .as_slice(),
+        );
+        assert_eq!(BATCH_TYPEHASH, expected);
+    }
+
+    #[test]
+    fn call_typehash_matches_string() {
+        let expected = keccak(b"Call(address to,uint256 value,bytes data)".as_slice());
+        assert_eq!(CALL_TYPEHASH, expected);
+    }
+
+    #[test]
+    fn batch_typehash_is_distinct_from_execute_and_rotate() {
+        assert_ne!(BATCH_TYPEHASH, EXECUTE_TYPEHASH);
+        assert_ne!(BATCH_TYPEHASH, ROTATE_TYPEHASH);
+        assert_ne!(BATCH_TYPEHASH, CALL_TYPEHASH);
+    }
+
+    #[test]
+    fn batch_shape_rejects_empty_mismatched_and_oversized() {
+        assert!(validate_batch_shape(0, 0, 0).is_err(), "empty batch");
+        assert!(validate_batch_shape(2, 1, 2).is_err(), "value len mismatch");
+        assert!(validate_batch_shape(2, 2, 1).is_err(), "data len mismatch");
+        assert!(
+            validate_batch_shape(MAX_BATCH_CALLS + 1, MAX_BATCH_CALLS + 1, MAX_BATCH_CALLS + 1)
+                .is_err(),
+            "over cap"
+        );
+        assert!(validate_batch_shape(1, 1, 1).is_ok());
+        assert!(validate_batch_shape(MAX_BATCH_CALLS, MAX_BATCH_CALLS, MAX_BATCH_CALLS).is_ok());
+    }
+
+    #[test]
+    fn batch_shape_error_carries_all_three_lengths() {
+        match validate_batch_shape(3, 2, 1) {
+            Err(P256AccountError::InvalidBatch(e)) => {
+                assert_eq!(e.calls, 3);
+                assert_eq!(e.values, 2);
+                assert_eq!(e.datas, 1);
+            }
+            other => panic!("expected InvalidBatch, got {other:?}"),
+        }
+    }
+
+    fn batch_fixture() -> (Vec<Address>, Vec<U256>, Vec<&'static [u8]>) {
+        (
+            vec![Address::from([0x11u8; 20]), Address::from([0x22u8; 20])],
+            vec![U256::from(0), U256::from(7)],
+            vec![b"approve".as_slice(), b"swap".as_slice()],
+        )
+    }
+
+    #[test]
+    fn batch_hash_is_domain_separated() {
+        let (to, value, data) = batch_fixture();
+        let acct = Address::from([0xaau8; 20]);
+        let other = Address::from([0xbbu8; 20]);
+
+        let base = compute_batch_hash(42161, acct, &to, &value, &data, U256::from(0));
+        assert_ne!(
+            base,
+            compute_batch_hash(1, acct, &to, &value, &data, U256::from(0)),
+            "chainId must bind"
+        );
+        assert_ne!(
+            base,
+            compute_batch_hash(42161, other, &to, &value, &data, U256::from(0)),
+            "account must bind"
+        );
+        assert_ne!(
+            base,
+            compute_batch_hash(42161, acct, &to, &value, &data, U256::from(1)),
+            "nonce must bind"
+        );
+    }
+
+    #[test]
+    fn batch_hash_is_order_sensitive() {
+        // approve-then-swap must not hash the same as swap-then-approve, or a
+        // relayer could reorder a signed batch into something harmful.
+        let (to, value, data) = batch_fixture();
+        let acct = Address::from([0xaau8; 20]);
+
+        let forward = compute_batch_hash(42161, acct, &to, &value, &data, U256::from(0));
+
+        let to_rev: Vec<Address> = to.iter().rev().copied().collect();
+        let value_rev: Vec<U256> = value.iter().rev().copied().collect();
+        let data_rev: Vec<&[u8]> = data.iter().rev().copied().collect();
+        let reversed =
+            compute_batch_hash(42161, acct, &to_rev, &value_rev, &data_rev, U256::from(0));
+
+        assert_ne!(forward, reversed);
+    }
+
+    #[test]
+    fn batch_hash_binds_every_field_of_every_call() {
+        let (to, value, data) = batch_fixture();
+        let acct = Address::from([0xaau8; 20]);
+        let base = compute_batch_hash(42161, acct, &to, &value, &data, U256::from(0));
+
+        let mut to2 = to.clone();
+        to2[1] = Address::from([0x33u8; 20]);
+        assert_ne!(base, compute_batch_hash(42161, acct, &to2, &value, &data, U256::from(0)));
+
+        let mut value2 = value.clone();
+        value2[1] = U256::from(8);
+        assert_ne!(base, compute_batch_hash(42161, acct, &to, &value2, &data, U256::from(0)));
+
+        let data2: Vec<&[u8]> = vec![b"approve".as_slice(), b"swap!".as_slice()];
+        assert_ne!(base, compute_batch_hash(42161, acct, &to, &value, &data2, U256::from(0)));
+    }
+
+    #[test]
+    fn single_call_batch_does_not_collide_with_execute() {
+        // The whole point of a separate typehash: a 1-call batch signature must
+        // not be replayable as a plain `execute` signature or vice versa.
+        let acct = Address::from([0xaau8; 20]);
+        let to = Address::from([0x11u8; 20]);
+        let value = U256::from(5);
+        let data = b"x".as_slice();
+        let nonce = U256::from(3);
+
+        let batch = compute_batch_hash(42161, acct, &[to], &[value], &[data], nonce);
+        let single = compute_execute_hash(42161, acct, to, value, data, nonce);
+        assert_ne!(batch, single);
+    }
+
+    #[test]
+    fn authorised_hash_rejects_nonce_mismatch_before_checking_signature() {
+        test_precompile::clear();
+        let hash = B256::from([0x42u8; 32]);
+        let sig = well_formed_sig();
+        let res = validate_authorised_hash(
+            hash,
+            U256::from(5),
+            U256::from(4),
+            U256::from(1),
+            U256::from(2),
+            &sig,
+        );
+        assert!(matches!(res, Err(P256AccountError::NonceMismatch(_))));
+        // The precompile must not have been consulted at all.
+        assert!(test_precompile::last_input().is_none());
+    }
+
+    #[test]
+    fn authorised_hash_rejects_bad_signature_and_accepts_good_one() {
+        let hash = B256::from([0x42u8; 32]);
+        let sig = well_formed_sig();
+
+        test_precompile::clear();
+        test_precompile::expect_next(false);
+        assert!(matches!(
+            validate_authorised_hash(hash, U256::ZERO, U256::ZERO, u(GX), u(GY), &sig),
+            Err(P256AccountError::InvalidSignature(_))
+        ));
+
+        test_precompile::clear();
+        test_precompile::expect_next(true);
+        assert!(validate_authorised_hash(
+            hash,
+            U256::ZERO,
+            U256::ZERO,
+            U256::from(1),
+            U256::from(2),
+            &sig
+        )
+        .is_ok());
+        // and it dispatched exactly the hash it was handed, not some
+        // re-derived digest — the fixture is a 0x42.. sentinel, not a batch hash
+        let seen = test_precompile::last_input().expect("precompile called");
+        assert_eq!(&seen[0..32], hash.as_slice());
+    }
+
+    // -----------------------------------------------------------------
+    // Token receiver hooks
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn receiver_magic_values_match_their_signatures() {
+        assert_eq!(
+            ERC721_RECEIVED_MAGIC,
+            keccak(b"onERC721Received(address,address,uint256,bytes)".as_slice()).as_slice()[0..4]
+        );
+        assert_eq!(
+            ERC1155_RECEIVED_MAGIC,
+            keccak(b"onERC1155Received(address,address,uint256,uint256,bytes)".as_slice())
+                .as_slice()[0..4]
+        );
+        assert_eq!(
+            ERC1155_BATCH_RECEIVED_MAGIC,
+            keccak(
+                b"onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)".as_slice()
+            )
+            .as_slice()[0..4]
+        );
+    }
+
+    #[test]
+    fn receiver_magics_are_distinct_from_the_eip1271_magic() {
+        // A collision here would let a token callback masquerade as a valid
+        // 1271 response to a caller that only checks four bytes.
+        assert_ne!(ERC721_RECEIVED_MAGIC, EIP1271_MAGIC);
+        assert_ne!(ERC1155_RECEIVED_MAGIC, EIP1271_MAGIC);
+        assert_ne!(ERC1155_BATCH_RECEIVED_MAGIC, EIP1271_MAGIC);
+    }
+
+    // -----------------------------------------------------------------
+    // Curve membership (C1 — off-curve rotation brick)
+    // -----------------------------------------------------------------
+
+    /// P-256 generator G.
+    const GX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+    const GY: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+    /// 2G — a second independent on-curve point.
+    const G2X: &str = "7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978";
+    const G2Y: &str = "07775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1";
+
+    fn u(hex: &str) -> U256 {
+        U256::from_be_bytes::<32>(
+            <[u8; 32]>::try_from(
+                (0..32)
+                    .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                    .collect::<Vec<u8>>()
+                    .as_slice(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn curve_b_constant_matches_the_standard() {
+        // b = 0x5AC6...604B from FIPS 186-4 / SEC 2 for P-256.
+        assert_eq!(
+            U256::from_be_bytes(P256_B),
+            u("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"),
+        );
+    }
+
+    #[test]
+    fn generator_and_double_are_on_curve() {
+        assert!(is_on_curve(u(GX), u(GY)), "G must satisfy the curve equation");
+        assert!(is_on_curve(u(G2X), u(G2Y)), "2G must satisfy the curve equation");
+    }
+
+    #[test]
+    fn perturbing_either_coordinate_leaves_the_curve() {
+        let (x, y) = (u(GX), u(GY));
+        assert!(!is_on_curve(x + U256::from(1), y));
+        assert!(!is_on_curve(x, y + U256::from(1)));
+        // Swapping coordinates is the classic transcription error.
+        assert!(!is_on_curve(y, x));
+    }
+
+    #[test]
+    fn negated_y_is_still_on_curve() {
+        // (x, p - y) is the reflection of a curve point and IS valid — the check
+        // must not reject it, or half of all legitimate keys would be refused.
+        let p = U256::from_be_bytes(P256_FIELD_PRIME);
+        assert!(is_on_curve(u(GX), p - u(GY)));
+    }
+
+    #[test]
+    fn rotation_to_an_off_curve_point_is_rejected() {
+        // Range-checking (x, y) without curve membership is what bricks the
+        // account: an off-curve owner is accepted, and from then on no
+        // signature can ever verify. Unrecoverable — there is no path back.
+        // See SPEC.md §6.
+        test_precompile::clear();
+        test_precompile::expect_next(true);
+        let sig = well_formed_sig();
+        let req = RotationRequest {
+            owner_x: u(GX),
+            owner_y: u(GY),
+            current_nonce: U256::ZERO,
+            chain_id: 42161,
+            account: Address::from([0xaau8; 20]),
+            new_x: u(GX) + U256::from(1), // in range, off curve
+            new_y: u(GY),
+            nonce: U256::ZERO,
+            signature: &sig,
+        };
+        assert!(matches!(
+            validate_rotation_request(&req),
+            Err(P256AccountError::InvalidPublicKey(_))
+        ));
+    }
+
+    #[test]
+    fn rotation_to_a_real_curve_point_is_accepted() {
+        test_precompile::clear();
+        test_precompile::expect_next(true);
+        let sig = well_formed_sig();
+        let req = RotationRequest {
+            owner_x: u(GX),
+            owner_y: u(GY),
+            current_nonce: U256::ZERO,
+            chain_id: 42161,
+            account: Address::from([0xaau8; 20]),
+            new_x: u(G2X),
+            new_y: u(G2Y),
+            nonce: U256::ZERO,
+            signature: &sig,
+        };
+        assert!(validate_rotation_request(&req).is_ok());
+    }
+
+    #[test]
+    fn constructor_rejects_off_curve_and_accepts_the_generator() {
+        assert!(validate_constructor_args(u(GX), u(GY)).is_ok());
+        assert!(matches!(
+            validate_constructor_args(u(GX), u(GY) + U256::from(1)),
+            Err(P256AccountError::InvalidPublicKey(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // EIP-1271 / PersonalSign domain separation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn personal_sign_typehash_matches_string() {
+        assert_eq!(
+            PERSONAL_SIGN_TYPEHASH,
+            keccak(b"PersonalSign(bytes32 hash)".as_slice()),
+        );
+    }
+
+    #[test]
+    fn an_execute_digest_presented_as_a_1271_challenge_no_longer_round_trips() {
+        // THE attack this wrapper exists for.
+        //
+        // 1. Attacker computes an Execute digest from public inputs
+        //    (chainId, account, to = attacker, value = 1 ETH, nonce = 0).
+        // 2. Presents it to the user as a "login challenge".
+        // 3. The wallet signs it via the EIP-1271 path.
+        //
+        // Before the wrapper, step 3 produced a signature over the Execute
+        // digest itself — i.e. a valid transfer authorisation. Now the 1271 path
+        // signs PersonalSign(digest), which is a different message entirely.
+        let chain_id = 42161u64;
+        let account = Address::from([0xaau8; 20]);
+        let attacker = Address::from([0xbau8; 20]);
+
+        let execute_digest = compute_execute_hash(
+            chain_id,
+            account,
+            attacker,
+            U256::from(1_000_000_000_000_000_000u64),
+            &[],
+            U256::ZERO,
+        );
+
+        let challenge = compute_personal_sign_hash(chain_id, account, execute_digest);
+
+        // The bytes actually signed on the 1271 path are NOT the execute digest.
+        assert_ne!(
+            challenge, execute_digest,
+            "a 1271 challenge must never equal the Execute digest it wraps",
+        );
+    }
+
+    #[test]
+    fn personal_sign_is_domain_separated() {
+        let hash = B256::from([0x11u8; 32]);
+        let a = Address::from([0xaau8; 20]);
+        let b = Address::from([0xbbu8; 20]);
+        let base = compute_personal_sign_hash(42161, a, hash);
+        assert_ne!(base, compute_personal_sign_hash(1, a, hash), "chainId must bind");
+        assert_ne!(base, compute_personal_sign_hash(42161, b, hash), "account must bind");
+        assert_ne!(
+            base,
+            compute_personal_sign_hash(42161, a, B256::from([0x12u8; 32])),
+            "the wrapped hash must bind",
+        );
+    }
+
+    #[test]
+    fn personal_sign_cannot_collide_with_any_authorisation_hash() {
+        let chain_id = 42161u64;
+        let account = Address::from([0xaau8; 20]);
+        let to = Address::from([0x11u8; 20]);
+        let nonce = U256::ZERO;
+
+        let exec = compute_execute_hash(chain_id, account, to, U256::ZERO, &[], nonce);
+        let rotate = compute_rotate_hash(chain_id, account, u(GX), u(GY), nonce);
+        let batch = compute_batch_hash(chain_id, account, &[to], &[U256::ZERO], &[&[]], nonce);
+
+        // Wrapping ANY of them yields something distinct from all of them.
+        for target in [exec, rotate, batch] {
+            let wrapped = compute_personal_sign_hash(chain_id, account, target);
+            assert_ne!(wrapped, exec);
+            assert_ne!(wrapped, rotate);
+            assert_ne!(wrapped, batch);
+        }
+    }
+
+    #[test]
+    fn selector_overrides_for_the_token_hooks_are_present_in_source() {
+        // Regression guard for the bug where stylus-proc exported
+        // `onErc721Received` (0x5ca688d3) instead of `onERC721Received`
+        // (0x150b7a02), silently making the account unable to receive NFTs.
+        //
+        // The magic-value constants passed throughout that bug because they
+        // check the constants, not the router's exported names. check-abi.sh
+        // catches it but needs cargo-stylus and only runs in CI, so assert the
+        // overrides here where `cargo test` will see them.
+        let src = include_str!("lib.rs");
+        for name in [
+            "onERC721Received",
+            "onERC1155Received",
+            "onERC1155BatchReceived",
+        ] {
+            assert!(
+                src.contains(&alloc::format!("#[selector(name = \"{name}\")]")),
+                "missing #[selector(name = \"{name}\")] — stylus-proc would export \
+                 the camel-cased Rust name instead, and the hook would never fire",
+            );
+        }
     }
 }
